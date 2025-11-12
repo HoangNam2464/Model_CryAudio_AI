@@ -1,0 +1,35 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.tmp
+*.log
+*.csv
+*.json
+
+# ===== Virtual Environment =====
+venv/
+.env/
+.venv/
+env.bak/
+
+# ===== Audio Data =====
+data_goc/
+data_new/
+*.wav
+
+# ===== Training / Model Outputs =====
+results.csv
+training_log.json
+
+# ===== IDE / Editor Files =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== System Files =====
+.DS_Store
+Thumbs.db
+
