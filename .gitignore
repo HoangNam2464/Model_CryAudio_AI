@@ -38,3 +38,22 @@ desktop.ini
 # ===== Project specific =====
 libdeps/
 test_output/
+
+# ===== Python / AI-related =====
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.npz
+*.pth
+*.onnx
+*.tflite
+*.wav
+*.csv
+*.json
+
+# ===== External libraries (exclude third-party libs) =====
+lib/flatbuffers/
+lib/gemmlowp/
+lib/kissfft/
+lib/tflite-micro-minimal/
