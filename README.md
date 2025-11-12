@@ -1,38 +1,80 @@
-# AudioCryESP32
+# ⚙️ AudioCryESP32DevKit — ESP32 AI Cry Detection Firmware
 
-ESP32 (ESP32-D0WD-V3) baby-cry detector with I2S microphone, TinyGPS++, on-device TFLite Micro inference, HTTP uploader, and a small local status API.
+## 🧩 Giới thiệu
+**AudioCryESP32DevKit** là firmware chạy trên ESP32, tích hợp mô hình AI để nhận diện tiếng khóc trẻ em và truyền dữ liệu định vị GPS thời gian thực về máy chủ.  
+Dự án được phát triển bằng **PlatformIO** trên **VSCode**, sử dụng mô hình AI đã huấn luyện từ `AudioCryProject`.
 
-## Hardware
+---
 
-- Mic I2S **INMP441** (BCLK=GPIO26, WS=GPIO25, DOUT=GPIO34, VDD=3V3, GND)
-- GPS **NEO-6M** (Serial1 RX=GPIO16, TX=GPIO17, VCC=3V3, GND)
-- LED status on GPIO2 (can reuse alarm LED)
-- MAX98357A class-D amp (BCLK=GPIO27, LRCK=GPIO14, DIN=GPIO23, SD optional)
+## 🛠 Cấu trúc thư mục
+```
+AudioCryESP32/
+│
+├── lib/                 # Thư viện người dùng và third-party
+│   ├── CryDetector/     # Nhận diện tiếng khóc (AI inference trên ESP32)
+│   ├── Gps/             # Xử lý module NEO-6M GPS
+│   ├── RestClient/      # Gửi dữ liệu REST API tới server Laravel/Vue
+│   ├── TflmInfer/       # TensorFlow Lite Micro runtime cho model .tflite
+│   ├── flatbuffers/     # (submodule, bỏ qua khi push)
+│   ├── gemmlowp/        # (submodule, bỏ qua khi push)
+│   ├── kissfft/         # (submodule, bỏ qua khi push)
+│   └── tflite-micro-minimal/  # (submodule, bỏ qua khi push)
+│
+├── src/                 # Mã nguồn chính (main.cpp, wifi, mqtt, log, ...)
+├── include/             # Header chung
+├── .gitignore           # Bỏ qua file build, log, cache, libs bên thứ ba
+├── platformio.ini       # Cấu hình build PlatformIO
+└── README.md            # Tài liệu hướng dẫn
+```
 
-## Pin map (`include/Config.h`)
+---
 
-All runtime pins, WiFi credentials, backend URLs, and GPS fallbacks live in `include/Config.h`. Update that file when you rewire or move devices.
+## 🧠 Các thư viện chính sử dụng
+| Thành phần | Mô tả |
+|-------------|-------|
+| **TensorFlow Lite Micro (TFLM)** | Chạy mô hình nhận diện tiếng khóc (.tflite) trên ESP32 |
+| **Flatbuffers** | Parser cho mô hình TFLite |
+| **KissFFT** | Tính toán FFT cho xử lý tín hiệu âm thanh |
+| **Gemmlowp** | Toán học ma trận tối ưu cho ESP32 |
+| **NEO-6M GPS** | Lấy vị trí (vĩ độ, kinh độ) |
+| **MAX98357A** | Giải mã I2S cho âm thanh phát loa |
+| **INMP441 Mic** | Ghi âm tín hiệu tiếng khóc (I2S input) |
 
-| Device            | Signals             | GPIO (default) | Notes                    |
-| ----------------- | ------------------- | -------------- | ------------------------ |
-| LED status        | LED                 | GPIO2          | Built-in LED supported   |
-| Mic INMP441       | BCLK / WS / DOUT    | 26 / 25 / 34   | Matches `I2S_*` macros   |
-| GPS NEO-6M        | RX / TX             | 16 / 17        | Serial1/UART2            |
-| MAX98357A         | BCLK / LRCK / DIN   | 27 / 14 / 23   | Enable `USE_MAX98357A*`  |
-| GPS fallback LL   | Lat / Lng           | Config.h       | Used when fix invalid    |
+---
 
-Refer to `include/board_config.h` for a terse summary of board-level wiring; no credentials are stored there anymore.
+## 🔧 Cách build & upload firmware
+1. Cài [**VSCode**](https://code.visualstudio.com/) và extension [**PlatformIO**](https://platformio.org/install/ide?install=vscode)
+2. Clone dự án:
+   ```bash
+   git clone --recursive https://gitlab.com/tranvuonghung/sumo.git
+   ```
+3. Mở thư mục `AudioCryESP32` trong VSCode  
+4. Kết nối ESP32 qua USB  
+5. Nhấn **PlatformIO → Upload** hoặc chạy:
+   ```bash
+   pio run --target upload
+   ```
+6. Theo dõi log:
+   ```bash
+   pio device monitor
+   ```
 
-## Quick start
+---
 
-1. Export your INT8 TFLite model to `src/crynet_model.cc` (for example with `convert/tflite_to_cc.py --var_name crynet_int8_tflite ...`). Keep the declarations in `include/crynet_model.h` in sync.
-2. Ensure `lib/tflite-micro-minimal/` (or your preferred TFLM build) is available under `lib/`.
-3. Update WiFi SSID/password, backend URL/token, and any GPS defaults inside `include/Config.h` (this is the single source of truth).
-4. Build & upload with PlatformIO (`platformio.ini` already pulls TinyGPS++ and ArduinoJson).
+## 🚀 Khi clone hoặc pull về máy khác
+Vì dự án dùng **submodule** (Flatbuffers, KissFFT, v.v.), cần tải về đầy đủ bằng:
+```bash
+git submodule update --init --recursive
+```
 
-## Runtime notes
+---
 
-- Audio capture runs at 16 kHz mono; `taskMic` pushes 1024-sample chunks into a FreeRTOS queue.
-- `lib/TflmInfer/tflm_infer.cpp` now performs full log-mel feature extraction plus TFLM inference. Increase `kTensorArenaSize` there if `AllocateTensors` fails.
-- Cry/no-cry debounce is handled by `lib/CryDetector`, configurable via constructor parameters in `src/main.cpp`.
-- Local HTTP server exposes `/` (health) and `/status` (JSON payload `{ device_id, ip, prob, score, crying, lat, lng, gps_valid }`).
+## 👤 Tác giả
+- **Người phát triển:** nom_05  
+- **Dự án:** SUMO → Model_CryESP32  
+- **Liên kết GitLab:** [https://gitlab.com/tranvuonghung/sumo](https://gitlab.com/tranvuonghung/sumo)
+
+---
+
+📘 *Mục tiêu của dự án:*  
+Tạo nền tảng firmware ESP32 hỗ trợ mô hình AI nhận diện tiếng khóc và định vị GPS chính xác, mở rộng khả năng giám sát trẻ em thông minh trong hệ sinh thái **AudioCry**.
