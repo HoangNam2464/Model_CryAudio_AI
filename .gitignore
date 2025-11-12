@@ -1,0 +1,40 @@
+# ===== PlatformIO build folders =====
+.pio/
+.pioenvs/
+.piolibdeps/
+.clangd/
+.cache/
+
+# ===== VSCode settings =====
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch
+.vscode/settings.json
+
+# ===== Build artifacts =====
+*.elf
+*.bin
+*.hex
+*.map
+*.a
+*.o
+*.d
+
+# ===== Logs =====
+*.log
+
+# ===== OS-specific files =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Backup / Temp files =====
+*.bak
+*.tmp
+*.swp
+*.swo
+
+# ===== Project specific =====
+libdeps/
+test_output/
