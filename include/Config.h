@@ -1,7 +1,7 @@
-#pragma once
+﻿#pragma once
 
 // ===== WiFi =====
-// �? tr?ng d? thi?t b? lu�n kh?i d?ng ? ch? d? c?u h�nh qua web
+// Để trống để thiết bị luôn khởi động ở chế độ cấu hình qua web
 #define WIFI_SSID      ""
 #define WIFI_PASS      ""
 
