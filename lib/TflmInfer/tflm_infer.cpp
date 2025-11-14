@@ -4,28 +4,31 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <new>
+#include <cstdint>
 
 #include "crynet_model.h"
 #include "feature_extraction.h"
+#include "esp_heap_caps.h"
 
 #include "tensorflow/lite/c/common.h"
-#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
 namespace {
 
-constexpr size_t kTensorArenaSize = 180 * 1024;  // adjust if AllocateTensors fails
+constexpr size_t kTensorArenaSize = 150 * 1024;  // adjust if AllocateTensors fails
 constexpr size_t kFeatureCount = kMelBins * kMelFrames;
 
-alignas(16) uint8_t g_tensor_arena[kTensorArenaSize];
+uint8_t* g_tensor_arena = nullptr;
 const tflite::Model* g_model = nullptr;
-tflite::AllOpsResolver g_resolver;
+tflite::MicroMutableOpResolver<12> g_resolver;
 tflite::MicroInterpreter* g_interpreter = nullptr;
 TfLiteTensor* g_input = nullptr;
 TfLiteTensor* g_output = nullptr;
 bool g_ready = false;
-std::array<float, kFeatureCount> g_mel_buffer{};
+float* g_mel_buffer = nullptr;
 
 bool CopyFeaturesToInput() {
     if (!g_input) {
@@ -37,7 +40,7 @@ bool CopyFeaturesToInput() {
             if (g_input->bytes < bytes_needed) {
                 return false;
             }
-            std::memcpy(g_input->data.f, g_mel_buffer.data(), bytes_needed);
+            std::memcpy(g_input->data.f, g_mel_buffer, bytes_needed);
             return true;
         }
         case kTfLiteInt8: {
@@ -110,14 +113,56 @@ bool tflm_begin() {
         return false;
     }
 
-    static tflite::MicroInterpreter s_interpreter(
-        g_model, g_resolver, g_tensor_arena, kTensorArenaSize);
+    static bool resolver_init = false;
+    if (!resolver_init) {
+        if (g_resolver.AddConv2D() != kTfLiteOk) return false;
+        if (g_resolver.AddDepthwiseConv2D() != kTfLiteOk) return false;
+        if (g_resolver.AddFullyConnected() != kTfLiteOk) return false;
+        if (g_resolver.AddSoftmax() != kTfLiteOk) return false;
+        if (g_resolver.AddReshape() != kTfLiteOk) return false;
+        if (g_resolver.AddAveragePool2D() != kTfLiteOk) return false;
+        if (g_resolver.AddMul() != kTfLiteOk) return false;
+        if (g_resolver.AddAdd() != kTfLiteOk) return false;
+        if (g_resolver.AddMaxPool2D() != kTfLiteOk) return false;
+        resolver_init = true;
+    }
 
-    if (s_interpreter.AllocateTensors() != kTfLiteOk) {
+    if (!g_tensor_arena) {
+        g_tensor_arena = static_cast<uint8_t*>(
+            heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!g_tensor_arena) {
+            g_tensor_arena = static_cast<uint8_t*>(
+                heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        }
+        if (!g_tensor_arena) {
+            return false;
+        }
+    }
+
+    if (!g_mel_buffer) {
+        g_mel_buffer = static_cast<float*>(
+            heap_caps_malloc(kFeatureCount * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!g_mel_buffer) {
+            g_mel_buffer = static_cast<float*>(
+                heap_caps_malloc(kFeatureCount * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        }
+        if (!g_mel_buffer) {
+            return false;
+        }
+    }
+
+    static tflite::MicroInterpreter* s_interpreter = nullptr;
+    static alignas(16) uint8_t interpreter_storage[sizeof(tflite::MicroInterpreter)];
+    if (!s_interpreter) {
+        s_interpreter = new(interpreter_storage)
+            tflite::MicroInterpreter(g_model, g_resolver, g_tensor_arena, kTensorArenaSize);
+    }
+
+    if (s_interpreter->AllocateTensors() != kTfLiteOk) {
         return false;
     }
 
-    g_interpreter = &s_interpreter;
+    g_interpreter = s_interpreter;
     g_input = g_interpreter->input(0);
     g_output = g_interpreter->output(0);
     g_ready = (g_input != nullptr && g_output != nullptr);
@@ -129,10 +174,10 @@ float tflm_infer_prob(const int16_t* pcm, size_t n_samples) {
         return 0.0f;
     }
 
-    if (!ComputeLogMelSpectrogram(pcm, n_samples, g_mel_buffer.data())) {
+    if (!ComputeLogMelSpectrogram(pcm, n_samples, g_mel_buffer)) {
         return 0.0f;
     }
-    StandardizeMelBands(g_mel_buffer.data());
+    StandardizeMelBands(g_mel_buffer);
 
     if (!CopyFeaturesToInput()) {
         return 0.0f;

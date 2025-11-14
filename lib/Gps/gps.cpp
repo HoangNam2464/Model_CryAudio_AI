@@ -14,7 +14,7 @@ static uint32_t lastFixMs = 0;
 static portMUX_TYPE fixLock = portMUX_INITIALIZER_UNLOCKED;
 constexpr uint32_t kFixTimeoutMs = 5000;
 
-void UpdateFixUnlocked(const TinyGPSLocation& loc) {
+void UpdateFixUnlocked(TinyGPSLocation& loc) {
     lastFix.lat = loc.lat();
     lastFix.lng = loc.lng();
     lastFix.valid = loc.isValid();

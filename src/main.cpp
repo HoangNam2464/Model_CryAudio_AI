@@ -83,7 +83,7 @@ static void i2s_init() {
     i2s_config_t cfg = {};
     cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
     cfg.sample_rate = I2S_SAMPLE_RATE;
-    cfg.bits_per_sample = I2S_BITS_PER_SAMP;
+    cfg.bits_per_sample = static_cast<i2s_bits_per_sample_t>(I2S_BITS_PER_SAMP);
     cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
