@@ -13,7 +13,6 @@
 #include <RestClient.h>
 #include <gps.h>
 #include <tflm_infer.h>
-#include <driver/gpio.h>
 
 // ===== Globals exposed to API =====
 float g_lastProb  = 0.0f;
@@ -22,7 +21,7 @@ bool  g_isCrying  = false;
 double g_lastLat  = 0.0;
 double g_lastLng  = 0.0;
 bool   g_gpsValid = false;
-char   g_statusMessage[64] = u8"Đang khởi động hệ thống...";
+char   g_statusMessage[64] = u8"??ang kh???i ?????ng h??? th???ng...";
 
 // ===== FreeRTOS handles =====
 static TaskHandle_t hMicTask    = nullptr;
@@ -39,7 +38,6 @@ static WiFiEventId_t g_wifiEventId = 0;
 static uint8_t g_wifiFailCount = 0;
 static uint32_t g_nextWifiRetryMs = 0;
 static uint8_t g_lastWifiReason = WIFI_REASON_UNSPECIFIED;
-static bool g_wifiConnected = false;
 
 struct CryEvent {
     bool crying;
@@ -75,7 +73,7 @@ static void ensure_setup_ap(){
     g_setupApSsid = String("AudioCry-Setup-") + suffix;
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(g_setupApSsid.c_str(), CONFIG_AP_PASS);
-    Serial.printf(u8"[WiFi] AP cấu hình bật: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
+    Serial.printf(u8"[WiFi] AP c???u h??nh b???t: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
     g_setupApActive = true;
 }
 
@@ -87,28 +85,29 @@ static void stop_setup_ap(){
 
 static const char* wifi_reason_to_text(uint8_t reason){
     switch(reason){
-        case WIFI_REASON_NO_AP_FOUND: return u8"không tìm thấy SSID";
-        case WIFI_REASON_AUTH_FAIL: return u8"sai mật khẩu";
-        case WIFI_REASON_BEACON_TIMEOUT: return u8"mất tín hiệu AP";
-        case WIFI_REASON_ASSOC_LEAVE: return u8"AP ngắt kết nối";
-        default: return u8"lý do khác";
+        case WIFI_REASON_NO_AP_FOUND: return u8"kh??ng t??m th???y SSID";
+        case WIFI_REASON_AUTH_FAIL: return u8"sai m???t kh???u";
+        case WIFI_REASON_BEACON_TIMEOUT: return u8"m???t t??n hi???u AP";
+        case WIFI_REASON_ASSOC_LEAVE: return u8"AP ng???t k???t n???i";
+        default: return u8"l?? do kh??c";
     }
 }
 
 static void handle_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info){
     switch(event){
         case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-            Serial.printf("[WiFi] Da ket noi toi AP %s\n", WiFi.SSID().c_str());
-            g_wifiConnected = true;
+            Serial.printf(u8"[WiFi] ???? k???t n???i t???i AP %s\n", WiFi.SSID().c_str());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
             g_lastWifiReason = info.wifi_sta_disconnected.reason;
             if (info.wifi_sta_disconnected.reason != WIFI_REASON_NO_AP_FOUND){
-                Serial.printf("[WiFi] Mat ket noi (reason=%d - %s). Se thu lai...\n",
+                Serial.printf(u8"[WiFi] M???t k???t n???i (reason=%d - %s). S??? th??? l???i...\n",
                               info.wifi_sta_disconnected.reason,
                               wifi_reason_to_text(info.wifi_sta_disconnected.reason));
             }
-            g_wifiConnected = false;
             break;
         default:
             break;
@@ -166,7 +165,7 @@ static void taskMic(void* arg) {
         uint32_t now = millis();
         if (now - lastLog > 10000){
             int16_t mid = block[CHUNK/2];
-            Serial.printf(u8"[MIC] %u khối OK, mẫu giữa=%d\n", blocksOk, mid);
+            Serial.printf(u8"[MIC] %u kh???i OK, m???u gi???a=%d\n", blocksOk, mid);
             lastLog = now;
             blocksOk=0;
         }
@@ -234,9 +233,9 @@ static void taskGps(void* arg){
         if (millis()-lastLog>10000){
             GpsFix fix = gps_get_fix();
             if (fix.valid){
-                Serial.printf(u8"[GPS] lat=%.5f lng=%.5f tuổi=%lu ms\n", fix.lat, fix.lng, fix.age_ms);
+                Serial.printf(u8"[GPS] lat=%.5f lng=%.5f tu???i=%lu ms\n", fix.lat, fix.lng, fix.age_ms);
             } else {
-                Serial.println(u8"[GPS] Đang tìm vệ tinh...");
+                Serial.println(u8"[GPS] ??ang t??m v??? tinh...");
             }
             lastLog = millis();
         }
@@ -248,8 +247,8 @@ static bool wifi_connect_blocking(){
     WifiCredentials creds;
     wifi_config_load(creds);
     if (creds.ssid.isEmpty()){
-        Serial.println(u8"[WiFi] Chưa có thông tin WiFi, bật AP cấu hình.");
-        setStatusMessage(u8"Chưa cấu hình WiFi, kết nối AP để nhập.");
+        Serial.println(u8"[WiFi] Ch??a c?? th??ng tin WiFi, b???t AP c???u h??nh.");
+        setStatusMessage(u8"Ch??a c???u h??nh WiFi, k???t n???i AP ????? nh???p.");
         ensure_setup_ap();
         return false;
     }
@@ -258,8 +257,8 @@ static bool wifi_connect_blocking(){
     }
     WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(true);
-    Serial.printf(u8"[WiFi] Đang kết nối tới \"%s\"...\n", creds.ssid.c_str());
-    setStatusMessage(u8"Đang chờ kết nối WiFi...");
+    Serial.printf(u8"[WiFi] ??ang k???t n???i t???i \"%s\"...\n", creds.ssid.c_str());
+    setStatusMessage(u8"??ang ch??? k???t n???i WiFi...");
     WiFi.begin(creds.ssid.c_str(), creds.pass.c_str());
     uint32_t t0=millis();
     while (WiFi.status()!=WL_CONNECTED && millis()-t0<20000){
@@ -267,19 +266,19 @@ static bool wifi_connect_blocking(){
     }
     bool ok = WiFi.status()==WL_CONNECTED;
     if (ok){
-        Serial.print(u8"[WiFi] Kết nối thành công, IP: ");
+        Serial.print(u8"[WiFi] K???t n???i th??nh c??ng, IP: ");
         Serial.println(WiFi.localIP());
-        setStatusMessage(u8"WiFi đã kết nối, đang khởi tạo...");
+        setStatusMessage(u8"WiFi ???? k???t n???i, ??ang kh???i t???o...");
         g_wifiFailCount = 0;
         g_nextWifiRetryMs = millis() + 5000;
         stop_setup_ap();
     } else {
         g_wifiFailCount = min<uint8_t>(g_wifiFailCount + 1, 10);
         uint32_t backoff = 3000 * g_wifiFailCount;
-        Serial.printf(u8"[WiFi] Kết nối thất bại (reason=%s). Sẽ thử lại sau %u giây.\n",
+        Serial.printf(u8"[WiFi] K???t n???i th???t b???i (reason=%s). S??? th??? l???i sau %u gi??y.\n",
                       wifi_reason_to_text(g_lastWifiReason), backoff/1000);
         g_nextWifiRetryMs = millis() + backoff;
-        setStatusMessage(u8"Không kết nối được WiFi, dùng AP cấu hình.");
+        setStatusMessage(u8"Kh??ng k???t n???i ???????c WiFi, d??ng AP c???u h??nh.");
         ensure_setup_ap();
     }
     return ok;
@@ -340,7 +339,7 @@ void setup(){
     esp_log_level_set("WiFi", ESP_LOG_NONE);
     wifi_config_init();
     ensure_setup_ap();
-    setStatusMessage("Dang khoi dong he thong...");
+    setStatusMessage(u8"??ang kh???i ?????ng h??? th???ng...");
     wifi_connect_blocking();
     api_begin();
     i2s_init();
@@ -352,7 +351,7 @@ void setup(){
     xTaskCreatePinnedToCore(taskInfer, "infer", 8192, nullptr, 3, &hInferTask, 1);
     xTaskCreatePinnedToCore(taskGps, "gps", 3072, nullptr, 1, &hGpsTask, 1);
     xTaskCreatePinnedToCore(taskSender, "sender", 4096, nullptr, 1, &hSendTask, 1);
-    setStatusMessage(u8"Hệ thống đang nghe âm thanh...");
+    setStatusMessage(u8"H??? th???ng ??ang nghe ??m thanh...");
 }
 
 void loop(){
@@ -371,5 +370,4 @@ void loop(){
     api_loop();
     delay(5);
 }
-
 
