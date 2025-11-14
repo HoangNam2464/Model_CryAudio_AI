@@ -98,13 +98,13 @@ static const char* wifi_reason_to_text(uint8_t reason){
 static void handle_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info){
     switch(event){
         case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-            Serial.printf("[WiFi] Da ket noi toi AP %s\n", WiFi.SSID().c_str());
+            Serial.printf("[WiFi] Đã kết nối tới AP %s\n", WiFi.SSID().c_str());
             g_wifiConnected = true;
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
             g_lastWifiReason = info.wifi_sta_disconnected.reason;
             if (info.wifi_sta_disconnected.reason != WIFI_REASON_NO_AP_FOUND){
-                Serial.printf("[WiFi] Mat ket noi (reason=%d - %s). Se thu lai...\n",
+                Serial.printf("[WiFi] Mất kết nối (reason=%d - %s). Sẽ thử lại...\n",
                               info.wifi_sta_disconnected.reason,
                               wifi_reason_to_text(info.wifi_sta_disconnected.reason));
             }
