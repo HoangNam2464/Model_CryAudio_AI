@@ -20,8 +20,8 @@ void wifi_config_init(){
 
 void wifi_config_load(WifiCredentials& creds){
     ensurePrefs();
-    creds.ssid = prefs.getString("ssid", WIFI_SSID);
-    creds.pass = prefs.getString("pass", WIFI_PASS);
+    creds.ssid = prefs.getString("ssid", "");
+    creds.pass = prefs.getString("pass", "");
 }
 
 void wifi_config_save(const WifiCredentials& creds){

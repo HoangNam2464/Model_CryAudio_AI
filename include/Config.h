@@ -1,8 +1,9 @@
 #pragma once
 
 // ===== WiFi =====
-#define WIFI_SSID      "Tro 3 Thang"
-#define WIFI_PASS      "78787878"
+// Ð? tr?ng d? thi?t b? luôn kh?i d?ng ? ch? d? c?u hình qua web
+#define WIFI_SSID      ""
+#define WIFI_PASS      ""
 
 // ===== Backend =====
 #define DEVICE_ID      "esp32-audiocry"
@@ -26,3 +27,6 @@
 #define GPS_RX_PIN   16
 #define GPS_TX_PIN   17
 #define GPS_BAUD     9600
+
+// ===== LED =====
+#define LED_PIN         2

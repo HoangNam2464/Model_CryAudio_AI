@@ -4,6 +4,7 @@
 #include <esp_heap_caps.h>
 #include <cstring>
 #include <esp_system.h>
+#include <esp_log.h>
 
 #include "Config.h"
 #include "WifiConfig.h"
@@ -286,6 +287,7 @@ static void taskSender(void* arg){
 
 void setup(){
     Serial.begin(115200); delay(200);
+    esp_log_level_set("wifi", ESP_LOG_ERROR);  // lược bỏ cảnh báo NO_AP_FOUND từ WiFiGeneric
     wifi_config_init();
     setStatusMessage("Dang khoi dong he thong...");
     wifi_connect_blocking();
