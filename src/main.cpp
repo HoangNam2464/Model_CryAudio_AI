@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include "driver/i2s.h"
 #include <esp_heap_caps.h>
+#include <cstring>
 
 #include "Config.h"
 #include "api_server.h"
@@ -17,6 +18,7 @@ bool  g_isCrying  = false;
 double g_lastLat  = 0.0;
 double g_lastLng  = 0.0;
 bool   g_gpsValid = false;
+char   g_statusMessage[64] = "Dang khoi dong he thong...";
 
 // ===== FreeRTOS handles =====
 static TaskHandle_t hMicTask    = nullptr;
@@ -44,6 +46,14 @@ static CryDetector detector(
     0.25f,
     INFER_INTERVAL_S
 );
+
+static void setStatusMessage(const char* msg){
+    if (!msg) return;
+    size_t len = strlen(msg);
+    if (len >= sizeof(g_statusMessage)) len = sizeof(g_statusMessage)-1;
+    memcpy(g_statusMessage, msg, len);
+    g_statusMessage[len] = '\0';
+}
 
 // ===== I2S setup =====
 static void i2s_init() {
@@ -75,6 +85,7 @@ static void i2s_init() {
 static void taskMic(void* arg) {
     const size_t CHUNK = I2S_READ_LEN;
     size_t bytes_read = 0;
+    uint32_t lastLog=0;
     for(;;){
         int16_t* block = static_cast<int16_t*>(heap_caps_malloc(CHUNK * sizeof(int16_t), MALLOC_CAP_8BIT));
         if (!block){
@@ -89,6 +100,12 @@ static void taskMic(void* arg) {
         }
         if (xQueueSend(qPcm, &block, 0) != pdTRUE) {
             heap_caps_free(block);
+        }
+        uint32_t now = millis();
+        if (now - lastLog > 10000){
+            int16_t mid = block[CHUNK/2];
+            Serial.printf("[MIC] block ok, mid=%d\n", mid);
+            lastLog = now;
         }
     }
 }
@@ -148,8 +165,18 @@ static void taskInfer(void* arg) {
 
 // ===== GPS Task =====
 static void taskGps(void* arg){
+    uint32_t lastLog=0;
     for(;;){
         gps_loop();
+        if (millis()-lastLog>10000){
+            GpsFix fix = gps_get_fix();
+            if (fix.valid){
+                Serial.printf("[GPS] lat=%.5f lng=%.5f\n", fix.lat, fix.lng);
+            } else {
+                Serial.println("[GPS] chua co fix");
+            }
+            lastLog = millis();
+        }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
@@ -157,12 +184,23 @@ static void taskGps(void* arg){
 static bool wifi_connect_blocking(){
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(true);
+    setStatusMessage("Dang cho ket noi WiFi...");
+    Serial.printf("[WiFi] Dang ket noi toi \"%s\"...\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     uint32_t t0=millis();
     while (WiFi.status()!=WL_CONNECTED && millis()-t0<20000){
         delay(300);
     }
-    return WiFi.status()==WL_CONNECTED;
+    bool ok = WiFi.status()==WL_CONNECTED;
+    if (ok){
+        Serial.print("[WiFi] Ket noi thanh cong, IP: ");
+        Serial.println(WiFi.localIP());
+        setStatusMessage("WiFi da ket noi, dang khoi tao...");
+    } else {
+        Serial.println("[WiFi] Ket noi that bai");
+        setStatusMessage("Khong the ket noi WiFi");
+    }
+    return ok;
 }
 
 static bool ensure_wifi(){
@@ -199,6 +237,7 @@ static void taskSender(void* arg){
 
 void setup(){
     Serial.begin(115200); delay(200);
+    setStatusMessage("Dang khoi dong he thong...");
     wifi_connect_blocking();
     api_begin();
     i2s_init();
@@ -210,6 +249,7 @@ void setup(){
     xTaskCreatePinnedToCore(taskInfer, "infer", 8192, nullptr, 3, &hInferTask, 1);
     xTaskCreatePinnedToCore(taskGps, "gps", 3072, nullptr, 1, &hGpsTask, 1);
     xTaskCreatePinnedToCore(taskSender, "sender", 4096, nullptr, 1, &hSendTask, 1);
+    setStatusMessage("He thong dang nghe am thanh...");
 }
 
 void loop(){
