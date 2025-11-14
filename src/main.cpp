@@ -3,8 +3,10 @@
 #include "driver/i2s.h"
 #include <esp_heap_caps.h>
 #include <cstring>
+#include <esp_system.h>
 
 #include "Config.h"
+#include "WifiConfig.h"
 #include "api_server.h"
 #include <CryDetector.h>
 #include <RestClient.h>
@@ -27,6 +29,10 @@ static TaskHandle_t hGpsTask    = nullptr;
 static TaskHandle_t hSendTask   = nullptr;
 static QueueHandle_t qPcm       = nullptr;
 static QueueHandle_t qEvents    = nullptr;
+static bool g_setupApActive = false;
+static String g_setupApSsid;
+static bool g_wifiReconnectRequest = false;
+static constexpr const char* CONFIG_AP_PASS = "crysetup";
 
 struct CryEvent {
     bool crying;
@@ -53,6 +59,23 @@ static void setStatusMessage(const char* msg){
     if (len >= sizeof(g_statusMessage)) len = sizeof(g_statusMessage)-1;
     memcpy(g_statusMessage, msg, len);
     g_statusMessage[len] = '\0';
+}
+
+static void ensure_setup_ap(){
+    if (g_setupApActive) return;
+    char suffix[7];
+    snprintf(suffix, sizeof(suffix), "%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
+    g_setupApSsid = String("AudioCry-Setup-") + suffix;
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(g_setupApSsid.c_str(), CONFIG_AP_PASS);
+    Serial.printf("[WiFi] AP cau hinh bat: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
+    g_setupApActive = true;
+}
+
+static void stop_setup_ap(){
+    if (!g_setupApActive) return;
+    WiFi.softAPdisconnect(true);
+    g_setupApActive = false;
 }
 
 // ===== I2S setup =====
@@ -182,11 +205,20 @@ static void taskGps(void* arg){
 }
 
 static bool wifi_connect_blocking(){
+    WifiCredentials creds;
+    wifi_config_load(creds);
+    if (creds.ssid.isEmpty()){
+        Serial.println("[WiFi] Chua co thong tin WiFi, bat AP cau hinh.");
+        setStatusMessage("Chua cau hinh WiFi, ket noi AP de nhap.");
+        ensure_setup_ap();
+        return false;
+    }
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(true);
+    stop_setup_ap();
+    Serial.printf("[WiFi] Dang ket noi toi \"%s\"...\n", creds.ssid.c_str());
     setStatusMessage("Dang cho ket noi WiFi...");
-    Serial.printf("[WiFi] Dang ket noi toi \"%s\"...\n", WIFI_SSID);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    WiFi.begin(creds.ssid.c_str(), creds.pass.c_str());
     uint32_t t0=millis();
     while (WiFi.status()!=WL_CONNECTED && millis()-t0<20000){
         delay(300);
@@ -197,8 +229,9 @@ static bool wifi_connect_blocking(){
         Serial.println(WiFi.localIP());
         setStatusMessage("WiFi da ket noi, dang khoi tao...");
     } else {
-        Serial.println("[WiFi] Ket noi that bai");
-        setStatusMessage("Khong the ket noi WiFi");
+        Serial.println("[WiFi] Ket noi that bai, bat AP cau hinh.");
+        setStatusMessage("Khong ket noi duoc WiFi, dung AP cau hinh.");
+        ensure_setup_ap();
     }
     return ok;
 }
@@ -206,6 +239,22 @@ static bool wifi_connect_blocking(){
 static bool ensure_wifi(){
     if (WiFi.status()==WL_CONNECTED) return true;
     return wifi_connect_blocking();
+}
+
+void wifi_request_reconnect(){
+    g_wifiReconnectRequest = true;
+}
+
+bool wifi_is_setup_ap_active(){
+    return g_setupApActive;
+}
+
+const char* wifi_get_setup_ap_ssid(){
+    return g_setupApSsid.c_str();
+}
+
+const char* wifi_get_setup_ap_pass(){
+    return CONFIG_AP_PASS;
 }
 
 static void taskSender(void* arg){
@@ -237,6 +286,7 @@ static void taskSender(void* arg){
 
 void setup(){
     Serial.begin(115200); delay(200);
+    wifi_config_init();
     setStatusMessage("Dang khoi dong he thong...");
     wifi_connect_blocking();
     api_begin();
@@ -254,6 +304,10 @@ void setup(){
 
 void loop(){
     static uint32_t lastCheck=0;
+    if (g_wifiReconnectRequest){
+        g_wifiReconnectRequest=false;
+        wifi_connect_blocking();
+    }
     if (millis()-lastCheck>5000){
         if (WiFi.status()!=WL_CONNECTED) wifi_connect_blocking();
         lastCheck=millis();
