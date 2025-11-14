@@ -34,6 +34,10 @@ static bool g_setupApActive = false;
 static String g_setupApSsid;
 static bool g_wifiReconnectRequest = false;
 static constexpr const char* CONFIG_AP_PASS = "crysetup";
+static WiFiEventId_t g_wifiEventId = 0;
+static uint8_t g_wifiFailCount = 0;
+static uint32_t g_nextWifiRetryMs = 0;
+static uint8_t g_lastWifiReason = WIFI_REASON_UNSPECIFIED;
 
 struct CryEvent {
     bool crying;
@@ -79,6 +83,37 @@ static void stop_setup_ap(){
     g_setupApActive = false;
 }
 
+static const char* wifi_reason_to_text(uint8_t reason){
+    switch(reason){
+        case WIFI_REASON_NO_AP_FOUND: return "khong tim thay SSID";
+        case WIFI_REASON_AUTH_FAIL: return "sai mat khau";
+        case WIFI_REASON_BEACON_TIMEOUT: return "mat tin hieu AP";
+        case WIFI_REASON_ASSOC_LEAVE: return "AP ngat ket noi";
+        default: return "ly do khac";
+    }
+}
+
+static void handle_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info){
+    switch(event){
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            Serial.printf("[WiFi] Da ket noi toi AP %s\n", WiFi.SSID().c_str());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            g_lastWifiReason = info.wifi_sta_disconnected.reason;
+            if (info.wifi_sta_disconnected.reason != WIFI_REASON_NO_AP_FOUND){
+                Serial.printf("[WiFi] Mat ket noi (reason=%d - %s). Se thu lai...\n",
+                              info.wifi_sta_disconnected.reason,
+                              wifi_reason_to_text(info.wifi_sta_disconnected.reason));
+            }
+            break;
+        default:
+            break;
+    }
+}
+
 // ===== I2S setup =====
 static void i2s_init() {
     i2s_config_t cfg = {};
@@ -110,6 +145,7 @@ static void taskMic(void* arg) {
     const size_t CHUNK = I2S_READ_LEN;
     size_t bytes_read = 0;
     uint32_t lastLog=0;
+    uint32_t blocksOk=0;
     for(;;){
         int16_t* block = static_cast<int16_t*>(heap_caps_malloc(CHUNK * sizeof(int16_t), MALLOC_CAP_8BIT));
         if (!block){
@@ -125,11 +161,13 @@ static void taskMic(void* arg) {
         if (xQueueSend(qPcm, &block, 0) != pdTRUE) {
             heap_caps_free(block);
         }
+        blocksOk++;
         uint32_t now = millis();
         if (now - lastLog > 10000){
             int16_t mid = block[CHUNK/2];
-            Serial.printf("[MIC] block ok, mid=%d\n", mid);
+            Serial.printf("[MIC] %u blocks ok, mid=%d\n", blocksOk, mid);
             lastLog = now;
+            blocksOk=0;
         }
     }
 }
@@ -195,9 +233,9 @@ static void taskGps(void* arg){
         if (millis()-lastLog>10000){
             GpsFix fix = gps_get_fix();
             if (fix.valid){
-                Serial.printf("[GPS] lat=%.5f lng=%.5f\n", fix.lat, fix.lng);
+                Serial.printf("[GPS] lat=%.5f lng=%.5f age=%lu ms\n", fix.lat, fix.lng, fix.age_ms);
             } else {
-                Serial.println("[GPS] chua co fix");
+                Serial.println("[GPS] dang tim ve tinh...");
             }
             lastLog = millis();
         }
@@ -214,9 +252,11 @@ static bool wifi_connect_blocking(){
         ensure_setup_ap();
         return false;
     }
-    WiFi.mode(WIFI_STA);
+    if (g_wifiEventId == 0){
+        g_wifiEventId = WiFi.onEvent(handle_wifi_event);
+    }
+    WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(true);
-    stop_setup_ap();
     Serial.printf("[WiFi] Dang ket noi toi \"%s\"...\n", creds.ssid.c_str());
     setStatusMessage("Dang cho ket noi WiFi...");
     WiFi.begin(creds.ssid.c_str(), creds.pass.c_str());
@@ -229,8 +269,15 @@ static bool wifi_connect_blocking(){
         Serial.print("[WiFi] Ket noi thanh cong, IP: ");
         Serial.println(WiFi.localIP());
         setStatusMessage("WiFi da ket noi, dang khoi tao...");
+        g_wifiFailCount = 0;
+        g_nextWifiRetryMs = millis() + 5000;
+        stop_setup_ap();
     } else {
-        Serial.println("[WiFi] Ket noi that bai, bat AP cau hinh.");
+        g_wifiFailCount = min<uint8_t>(g_wifiFailCount + 1, 10);
+        uint32_t backoff = 3000 * g_wifiFailCount;
+        Serial.printf("[WiFi] Ket noi that bai (reason=%s). Se thu lai sau %u giay.\n",
+                      wifi_reason_to_text(g_lastWifiReason), backoff/1000);
+        g_nextWifiRetryMs = millis() + backoff;
         setStatusMessage("Khong ket noi duoc WiFi, dung AP cau hinh.");
         ensure_setup_ap();
     }
@@ -287,8 +334,11 @@ static void taskSender(void* arg){
 
 void setup(){
     Serial.begin(115200); delay(200);
-    esp_log_level_set("wifi", ESP_LOG_ERROR);  // lược bỏ cảnh báo NO_AP_FOUND từ WiFiGeneric
+    esp_log_level_set("wifi", ESP_LOG_NONE);
+    esp_log_level_set("WiFiGeneric", ESP_LOG_NONE);
+    esp_log_level_set("WiFi", ESP_LOG_NONE);
     wifi_config_init();
+    ensure_setup_ap();
     setStatusMessage("Dang khoi dong he thong...");
     wifi_connect_blocking();
     api_begin();
@@ -310,9 +360,12 @@ void loop(){
         g_wifiReconnectRequest=false;
         wifi_connect_blocking();
     }
-    if (millis()-lastCheck>5000){
-        if (WiFi.status()!=WL_CONNECTED) wifi_connect_blocking();
-        lastCheck=millis();
+    uint32_t now = millis();
+    if (now - lastCheck>1000){
+        if (WiFi.status()!=WL_CONNECTED && now >= g_nextWifiRetryMs) {
+            wifi_connect_blocking();
+        }
+        lastCheck=now;
     }
     api_loop();
     delay(5);
