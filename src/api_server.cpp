@@ -90,6 +90,7 @@ static void handleWifiConfig(){
     server.send(200, "text/html", html);
 }
 
+
 void api_begin(){
     server.on("/", handleRoot);
     server.on("/status", handleStatus);

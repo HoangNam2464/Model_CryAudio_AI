@@ -6,6 +6,7 @@
 #include <cstring>
 #include <new>
 #include <cstdint>
+#include <esp_attr.h>
 
 #include "crynet_model.h"
 #include "feature_extraction.h"
@@ -152,7 +153,7 @@ bool tflm_begin() {
     }
 
     static tflite::MicroInterpreter* s_interpreter = nullptr;
-    static alignas(16) uint8_t interpreter_storage[sizeof(tflite::MicroInterpreter)];
+    static uint8_t interpreter_storage[sizeof(tflite::MicroInterpreter)] __attribute__((aligned(16)));
     if (!s_interpreter) {
         s_interpreter = new(interpreter_storage)
             tflite::MicroInterpreter(g_model, g_resolver, g_tensor_arena, kTensorArenaSize);
