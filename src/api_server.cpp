@@ -12,6 +12,9 @@ extern double g_lastLat;
 extern double g_lastLng;
 extern bool   g_gpsValid;
 extern char   g_statusMessage[64];
+extern bool   nightMode;
+extern const char* g_lastEvent;
+extern uint32_t g_lastEventTs;
 extern void wifi_request_reconnect();
 extern bool wifi_is_setup_ap_active();
 extern const char* wifi_get_setup_ap_ssid();
@@ -33,7 +36,10 @@ static void handleStatus(){
     json += "\"lat\":"+String(g_lastLat,6)+",";
     json += "\"lng\":"+String(g_lastLng,6)+",";
     json += "\"gps_valid\":"; json += (g_gpsValid ? "true":"false"); json += ",";
-    json += "\"status\":\""+String(g_statusMessage)+"\"";
+    json += "\"status\":\""+String(g_statusMessage)+"\",";
+    json += "\"night_mode\":"; json += (nightMode ? "true":"false"); json += ",";
+    json += "\"last_event\":\""+String(g_lastEvent)+"\",";
+    json += "\"last_event_ts\":"; json += String(g_lastEventTs);
     json += "}";
     server.send(200, "application/json", json);
 }

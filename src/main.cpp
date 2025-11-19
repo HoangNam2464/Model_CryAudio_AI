@@ -3,6 +3,8 @@
 #include "driver/i2s.h"
 #include <esp_heap_caps.h>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
 #include <esp_system.h>
 #include <esp_log.h>
 
@@ -14,6 +16,9 @@
 #include <gps.h>
 #include <tflm_infer.h>
 #include <driver/gpio.h>
+#if USE_MAX98357A_SPK
+#include "SpeechSamples.h"
+#endif
 
 // ===== Globals exposed to API =====
 float g_lastProb  = 0.0f;
@@ -31,6 +36,13 @@ static TaskHandle_t hGpsTask    = nullptr;
 static TaskHandle_t hSendTask   = nullptr;
 static QueueHandle_t qPcm       = nullptr;
 static QueueHandle_t qEvents    = nullptr;
+#if USE_MAX98357A_SPK
+static QueueHandle_t qSpeaker   = nullptr;
+enum class SpeakCmd : uint8_t { Cry, Calm, NightOn, NightOff, Ting };
+static constexpr uint32_t REMIND_INTERVAL_MS = 180000; // 3 phút
+bool nightMode = false; // bật chế độ đêm nếu cần
+static uint32_t g_lastCryChangeMs = 0;
+#endif
 static bool g_setupApActive = false;
 static String g_setupApSsid;
 static bool g_wifiReconnectRequest = false;
@@ -40,6 +52,10 @@ static uint8_t g_wifiFailCount = 0;
 static uint32_t g_nextWifiRetryMs = 0;
 static uint8_t g_lastWifiReason = WIFI_REASON_UNSPECIFIED;
 static bool g_wifiConnected = false;
+const char* g_lastEvent = "idle";
+uint32_t g_lastEventTs = 0;
+static bool g_btnPrev = true;
+static uint32_t g_btnLastMs = 0;
 
 struct CryEvent {
     bool crying;
@@ -94,6 +110,102 @@ static void updateCryLed(bool crying){
     digitalWrite(LED_CRY_GREEN_PIN, crying ? LOW : HIGH);
 }
 
+static void blinkWifiLed(uint8_t times){
+    for (uint8_t i=0;i<times;i++){
+        digitalWrite(LED_WIFI_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        digitalWrite(LED_WIFI_PIN, LOW);
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+    updateWifiLed();
+}
+
+#if USE_MAX98357A_SPK
+static void speaker_write(const int16_t* data, size_t samples){
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data);
+    size_t bytesRemaining = samples * sizeof(int16_t);
+    while (bytesRemaining > 0){
+        size_t written = 0;
+        esp_err_t err = i2s_write(I2S_NUM_0, ptr, bytesRemaining, &written, pdMS_TO_TICKS(200));
+        if (err != ESP_OK || written == 0){
+            break;
+        }
+        ptr += written;
+        bytesRemaining -= written;
+    }
+}
+
+static void speaker_play_phrase(const int16_t* data, size_t samples){
+    constexpr size_t CHUNK_SAMPLES = 256;
+    static int16_t chunk[CHUNK_SAMPLES];
+    size_t offset = 0;
+    while (offset < samples){
+        size_t copy = std::min(CHUNK_SAMPLES, samples - offset);
+        memcpy(chunk, data + offset, copy * sizeof(int16_t));
+        speaker_write(chunk, copy);
+        offset += copy;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+static void speaker_play_cmd(SpeakCmd cmd){
+    switch(cmd){
+        case SpeakCmd::Cry:
+            speaker_play_phrase(gSpeechCry, gSpeechCry_LEN);
+            break;
+        case SpeakCmd::Calm:
+            speaker_play_phrase(gSpeechCalm, gSpeechCalm_LEN);
+            break;
+        case SpeakCmd::NightOn:
+            speaker_play_phrase(gSpeechNightOn, gSpeechNightOn_LEN);
+            break;
+        case SpeakCmd::NightOff:
+            speaker_play_phrase(gSpeechNightOff, gSpeechNightOff_LEN);
+            break;
+        case SpeakCmd::Ting: {
+            constexpr size_t N = 3200; // ~200ms @16kHz
+            static int16_t buf[N];
+            static bool inited = false;
+            if (!inited){
+                for (size_t i=0;i<N;++i){
+                    float env = sinf(3.14159f * i / N);
+                    float s = sinf(2.0f*3.14159f*600.0f*i/16000.0f)*env;
+                    buf[i] = static_cast<int16_t>(s*12000.0f);
+                }
+                inited = true;
+            }
+            speaker_write(buf, N);
+            break;
+        }
+    }
+}
+
+static void taskSpeaker(void*){
+    SpeakCmd cmd = SpeakCmd::Calm;
+    for(;;){
+        if (xQueueReceive(qSpeaker, &cmd, portMAX_DELAY) == pdTRUE){
+            speaker_play_cmd(cmd);
+        }
+    }
+}
+
+static void speaker_enqueue(SpeakCmd cmd){
+    if (!qSpeaker) return;
+    static SpeakCmd lastCmd = SpeakCmd::Calm;
+    static uint32_t lastMs = 0;
+    uint32_t now = millis();
+    if (cmd == lastCmd && (now - lastMs) < 2000){
+        return; // bỏ qua lệnh trùng quá gần tránh spam
+    }
+    if (xQueueSend(qSpeaker, &cmd, 0) == pdTRUE){
+        lastCmd = cmd;
+        lastMs = now;
+    }
+}
+#else
+static void speaker_enqueue(...) {}
+#endif
+
 static const char* wifi_reason_to_text(uint8_t reason){
     switch(reason){
         case WIFI_REASON_NO_AP_FOUND: return "không tìm thấy SSID";
@@ -130,6 +242,9 @@ static void handle_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info){
 static void i2s_init() {
     i2s_config_t cfg = {};
     cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+#if USE_MAX98357A_SPK
+    cfg.mode = (i2s_mode_t)(cfg.mode | I2S_MODE_TX);
+#endif
     cfg.sample_rate = I2S_SAMPLE_RATE;
     cfg.bits_per_sample = static_cast<i2s_bits_per_sample_t>(I2S_BITS_PER_SAMP);
     cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
@@ -144,7 +259,11 @@ static void i2s_init() {
     i2s_pin_config_t pins = {};
     pins.bck_io_num   = I2S_SCK_PIN;
     pins.ws_io_num    = I2S_WS_PIN;
+#if USE_MAX98357A_SPK
+    pins.data_out_num = I2S_SD_OUT_PIN;
+#else
     pins.data_out_num = -1;
+#endif
     pins.data_in_num  = I2S_SD_PIN;
 
     i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
@@ -220,6 +339,15 @@ static void taskInfer(void* arg) {
             GpsFix fix = gps_get_fix();
             g_lastLat = fix.lat; g_lastLng = fix.lng; g_gpsValid = fix.valid;
             updateCryLed(state);
+            if (nightMode){
+                if (state){
+                    speaker_enqueue(SpeakCmd::Ting);
+                } else {
+                    speaker_enqueue(SpeakCmd::Ting);
+                }
+            } else {
+                speaker_enqueue(state ? SpeakCmd::Cry : SpeakCmd::Calm);
+            }
             CryEvent evt{};
             evt.crying = state;
             evt.prob = prob;
@@ -228,10 +356,20 @@ static void taskInfer(void* arg) {
             evt.lng = g_lastLng;
             evt.gpsValid = g_gpsValid;
             evt.tsMs = millis();
+            g_lastCryChangeMs = evt.tsMs;
+            g_lastEvent = state ? "cry_on" : "cry_off";
+            g_lastEventTs = evt.tsMs;
             if (xQueueSend(qEvents, &evt, pdMS_TO_TICKS(50)) != pdTRUE) {
                 Serial.println("Event queue full, dropping cry event");
             }
             prevState = state;
+        } else if (state && (millis() - g_lastCryChangeMs) > REMIND_INTERVAL_MS) {
+            g_lastCryChangeMs = millis();
+            if (nightMode){
+                speaker_enqueue(SpeakCmd::Ting);
+            } else {
+                speaker_enqueue(SpeakCmd::Cry);
+            }
         }
         filled = 0;
         vTaskDelay(delayTicks);
@@ -360,6 +498,7 @@ void setup(){
     pinMode(LED_WIFI_PIN, OUTPUT);
     pinMode(LED_CRY_RED_PIN, OUTPUT);
     pinMode(LED_CRY_GREEN_PIN, OUTPUT);
+    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
     updateWifiLed();
     updateCryLed(false);
     wifi_connect_blocking();
@@ -369,20 +508,66 @@ void setup(){
 
     qPcm = xQueueCreate(12, sizeof(int16_t*));
     qEvents = xQueueCreate(6, sizeof(CryEvent));
+#if USE_MAX98357A_SPK
+    qSpeaker = xQueueCreate(4, sizeof(SpeakCmd));
+#endif
     xTaskCreatePinnedToCore(taskMic, "mic", 4096, nullptr, 2, &hMicTask, 0);
     xTaskCreatePinnedToCore(taskInfer, "infer", 8192, nullptr, 3, &hInferTask, 1);
     xTaskCreatePinnedToCore(taskGps, "gps", 3072, nullptr, 1, &hGpsTask, 1);
     xTaskCreatePinnedToCore(taskSender, "sender", 4096, nullptr, 1, &hSendTask, 1);
+#if USE_MAX98357A_SPK
+    if (qSpeaker){
+        xTaskCreatePinnedToCore(taskSpeaker, "speaker", 4096, nullptr, 1, nullptr, 1);
+    }
+#endif
     setStatusMessage("Hệ thống đang nghe âm thanh...");
 }
 
 void loop(){
     static uint32_t lastCheck=0;
+    // handle BOOT button toggle for night mode (debounced, toggle once per press)
+    static bool rawPrev = true;      // GPIO0 có pull-up, nên mặc định HIGH (not pressed)
+    static bool stableState = true;  // true = không nhấn, false = nhấn
+    static uint32_t lastModeToggleMs = 0;
+    static uint32_t pressStartMs = 0;
+    static uint32_t lastChangeMs = 0;
+    const uint32_t DEBOUNCE_MS = 60;        // lọc nhiễu ngắn
+    const uint32_t MIN_PRESS_MS = 120;      // nhấn tối thiểu
+    const uint32_t MAX_PRESS_MS = 4000;     // nhấn tối đa (tránh giữ để flash)
+    const uint32_t TOGGLE_GAP_MS = 900;     // cách 2 lần toggle
+    const uint32_t IGNORE_AFTER_RESET_MS = 1200;
+
+    uint32_t now = millis();
+    bool rawNow = (digitalRead(BOOT_BUTTON_PIN) == LOW); // active low
+
+    if (rawNow != rawPrev){
+        rawPrev = rawNow;
+        lastChangeMs = now;
+    }
+    if ((now - lastChangeMs) > DEBOUNCE_MS && stableState != rawPrev){
+        stableState = rawPrev;
+        if (!stableState){
+            pressStartMs = now; // stable pressed
+        } else {
+            if (pressStartMs > 0){
+                uint32_t pressDur = now - pressStartMs;
+                if (now > IGNORE_AFTER_RESET_MS &&
+                    pressDur >= MIN_PRESS_MS && pressDur <= MAX_PRESS_MS &&
+                    (now - lastModeToggleMs) > TOGGLE_GAP_MS) {
+                    nightMode = !nightMode;
+                    lastModeToggleMs = now;
+                    Serial.printf("[MODE] nightMode=%s\n", nightMode ? "ON" : "OFF");
+                    blinkWifiLed(nightMode ? 2 : 1);
+                    speaker_enqueue(nightMode ? SpeakCmd::NightOn : SpeakCmd::NightOff);
+                }
+            }
+            pressStartMs = 0;
+        }
+    }
     if (g_wifiReconnectRequest){
         g_wifiReconnectRequest=false;
         wifi_connect_blocking();
     }
-    uint32_t now = millis();
     if (now - lastCheck>1000){
         if (WiFi.status()!=WL_CONNECTED && now >= g_nextWifiRetryMs) {
             wifi_connect_blocking();

@@ -24,6 +24,7 @@
 #define I2S_WS_PIN         25
 #define I2S_SCK_PIN        26
 #define I2S_SD_PIN         22
+#define I2S_SD_OUT_PIN     27      // DOUT tới MAX98357A
 #define I2S_SAMPLE_RATE    16000
 #define I2S_READ_LEN       1024
 #define I2S_BITS_PER_SAMP  16
@@ -46,6 +47,14 @@
 #define LED_WIFI_PIN        2   // LED xanh dương on-board (GPIO2 / D2)
 #define LED_CRY_RED_PIN     4   // LED đỏ báo đang khóc (GPIO4 / D4)
 #define LED_CRY_GREEN_PIN   5   // LED xanh lá khi im lặng (GPIO5 / D5)
+#define BOOT_BUTTON_PIN     0   // dùng nút BOOT (có lọc mềm mạnh)
+
+/* ============================================================
+ *  Tuỳ chọn loa MAX98357A
+ * ============================================================ */
+#ifndef USE_MAX98357A_SPK
+#define USE_MAX98357A_SPK   1
+#endif
 
 /* ============================================================
  *  I2C (tuỳ chọn cho OLED / cảm biến I2C khác)
