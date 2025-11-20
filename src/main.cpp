@@ -46,7 +46,7 @@ bool  g_isCrying  = false;
 double g_lastLat  = 0.0;
 double g_lastLng  = 0.0;
 bool   g_gpsValid = false;
-char   g_statusMessage[64] = "Dang khoi dong he thong...";
+char   g_statusMessage[64] = u8"Đang khởi động hệ thống...";
 
 // ===== FreeRTOS handles =====
 static TaskHandle_t hMicTask    = nullptr;
@@ -341,30 +341,30 @@ static void speaker_enqueue(...) {}
 
 static const char* wifi_reason_to_text(uint8_t reason){
     switch(reason){
-        case WIFI_REASON_NO_AP_FOUND: return "không tìm th?y SSID";
-        case WIFI_REASON_AUTH_FAIL: return "sai m?t kh?u";
-        case WIFI_REASON_BEACON_TIMEOUT: return "m?t tín hi?u AP";
-        case WIFI_REASON_ASSOC_LEAVE: return "AP ng?t k?t n?i";
-        default: return "lý do khác";
+        case WIFI_REASON_NO_AP_FOUND: return u8"không tìm thấy SSID";
+        case WIFI_REASON_AUTH_FAIL: return u8"sai mật khẩu";
+        case WIFI_REASON_BEACON_TIMEOUT: return u8"mất tín hiệu AP";
+        case WIFI_REASON_ASSOC_LEAVE: return u8"AP ngắt kết nối";
+        default: return u8"lý do khác";
     }
 }
 
 static void handle_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info){
     switch(event){
         case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-            Serial.printf("[WiFi] Ðã k?t n?i t?i AP %s\n", WiFi.SSID().c_str());
-            g_wifiConnected = true;
-            updateWifiLed();
+            LOGI(u8"[WiFi] Đã kết nối tới AP %s
+", WiFi.SSID().c_str());
+            wifi_mark_connected();
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
             g_lastWifiReason = info.wifi_sta_disconnected.reason;
             if (info.wifi_sta_disconnected.reason != WIFI_REASON_NO_AP_FOUND){
-                Serial.printf("[WiFi] M?t k?t n?i (reason=%d - %s). S? th? l?i...\n",
-                              info.wifi_sta_disconnected.reason,
-                              wifi_reason_to_text(info.wifi_sta_disconnected.reason));
+                LOGW(u8"[WiFi] Mất kết nối (reason=%d - %s). Sẽ thử lại...
+",
+                     info.wifi_sta_disconnected.reason,
+                     wifi_reason_to_text(info.wifi_sta_disconnected.reason));
             }
-            g_wifiConnected = false;
-            updateWifiLed();
+            wifi_mark_disconnected();
             break;
         default:
             break;
@@ -568,8 +568,8 @@ static void taskGps(void* arg){
 
 static bool wifi_connect_blocking(){
     if (g_wifiPausedAfterFail){
-        LOGW("[WiFi] Dang tam dung thu lai cho toi khi cau hinh moi.");
-        setStatusMessage("Dang dung AP cau hinh, vui long nhap WiFi moi.");
+        LOGW(u8"[WiFi] Đang tạm dừng thử lại cho tới khi cấu hình mới.");
+        setStatusMessage(u8"Đang dùng AP cấu hình, vui lòng nhập WiFi mới.");
         ensure_setup_ap();
         wifi_mark_disconnected();
         return false;
@@ -577,13 +577,13 @@ static bool wifi_connect_blocking(){
     WifiCredentials creds;
     wifi_config_load(creds);
     if (creds.ssid.isEmpty()){
-        LOGW("[WiFi] Chua co thong tin WiFi, bat AP cau hinh.");
-        setStatusMessage("Chua cau hinh WiFi, ket noi AP de nhap.");
+        LOGW(u8"[WiFi] Chưa có thông tin WiFi, bật AP cấu hình.");
+        setStatusMessage(u8"Chưa cấu hình WiFi, kết nối AP để nhập.");
         ensure_setup_ap();
         String portal = get_setup_portal_url();
         if (portal.length()){
-            LOGI("[WiFi] Mo %s de nhap WiFi.\n", portal.c_str());
-            String msg = String("Chua co WiFi, mo ") + portal;
+            LOGI(u8"[WiFi] Mở %s để nhập WiFi.\n", portal.c_str());
+            String msg = String(u8"Chưa có WiFi, mở ") + portal;
             setStatusMessage(msg.c_str());
         }
         g_wifiPausedAfterFail = true;
@@ -595,8 +595,8 @@ static bool wifi_connect_blocking(){
     }
     WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(true);
-    LOGI("[WiFi] Dang ket noi toi \"%s\"...\n", creds.ssid.c_str());
-    setStatusMessage("Dang cho ket noi WiFi...");
+    LOGI(u8"[WiFi] Đang kết nối tới \"%s\"...\n", creds.ssid.c_str());
+    setStatusMessage(u8"Đang chờ kết nối WiFi...");
     WiFi.begin(creds.ssid.c_str(), creds.pass.c_str());
     uint32_t t0=millis();
     while (WiFi.status()!=WL_CONNECTED && millis()-t0<WIFI_CONNECT_TIMEOUT_MS){
@@ -604,28 +604,28 @@ static bool wifi_connect_blocking(){
     }
     bool ok = WiFi.status()==WL_CONNECTED;
     if (ok){
-        LOGI("[WiFi] Ket noi thanh cong, IP: %s\n", WiFi.localIP().toString().c_str());
+        LOGI(u8"[WiFi] Kết nối thành công, IP: %s\n", WiFi.localIP().toString().c_str());
         String cfgUrl = String("http://") + WiFi.localIP().toString() + "/wifi";
-        LOGI("[WiFi] Trang cau hinh: %s\n", cfgUrl.c_str());
-        setStatusMessage("WiFi da ket noi, dang khoi tao...");
+        LOGI(u8"[WiFi] Trang cấu hình: %s\n", cfgUrl.c_str());
+        setStatusMessage(u8"WiFi đã kết nối, đang khởi tạo...");
         g_wifiFailCount = 0;
         g_wifiPausedAfterFail = false;
         wifi_mark_connected();
         stop_setup_ap();
     } else {
         g_wifiFailCount = std::min<uint8_t>(g_wifiFailCount + 1, 10);
-        LOGW("[WiFi] Ket noi that bai (reason=%s).\n", wifi_reason_to_text(g_lastWifiReason));
+        LOGW(u8"[WiFi] Kết nối thất bại (reason=%s).\n", wifi_reason_to_text(g_lastWifiReason));
         wifi_mark_disconnected();
         ensure_setup_ap();
         if (!g_wifiPausedAfterFail){
             g_wifiPausedAfterFail = true;
-            LOGW("[WiFi] Tam ngung thu lai cho toi khi nhap WiFi moi hoac reboot.");
+            LOGW(u8"[WiFi] Tạm ngưng thử lại cho tới khi nhập WiFi mới hoặc reboot.");
         }
-        setStatusMessage("Khong ket noi duoc, vui long dung AP cau hinh.");
+        setStatusMessage(u8"Không kết nối được, vui lòng dùng AP cấu hình.");
         String portal = get_setup_portal_url();
         if (portal.length()){
-            LOGI("[WiFi] Vui long mo %s de nhap lai WiFi.\n", portal.c_str());
-            String msg = String("Khong ket noi, mo ") + portal;
+            LOGI(u8"[WiFi] Vui lòng mở %s để nhập lại WiFi.\n", portal.c_str());
+            String msg = String(u8"Không kết nối, mở ") + portal;
             setStatusMessage(msg.c_str());
         }
     }
@@ -698,7 +698,7 @@ static void taskSender(void* arg){
             continue;
         }
         while (!ensure_wifi(15000)){
-            LOGW("[Send] WiFi unavailable, waiting to push event...");
+            LOGW(u8"[Send] WiFi chưa sẵn sàng, chờ gửi sự kiện...");
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
         String json = "{";
@@ -718,12 +718,12 @@ static void taskSender(void* arg){
             if (RestClient::postJSON(BACKEND_URL, json)){
                 sent = true;
             } else {
-                LOGW("[Send] Failed to post cry event attempt %u", attempt+1);
+                LOGW(u8"[Send] Gửi sự kiện thất bại lần %u", attempt+1);
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
         }
         if (!sent){
-            LOGE("[Send] Dropping cry event after retries");
+            LOGE(u8"[Send] Bỏ sự kiện khóc sau khi thử nhiều lần");
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -744,7 +744,7 @@ static void initRuntime(){
             Serial.println("[WiFi] Failed to create event group");
         }
     }
-    setStatusMessage("Dang khoi dong he thong...");
+    setStatusMessage(u8"Đang khởi động hệ thống...");
 }
 static void initGpioAndStatus(){
     pinMode(LED_WIFI_PIN, OUTPUT);
@@ -832,7 +832,7 @@ void setup(){
     initQueues();
     startTasks();
     g_wifiReconnectRequest = true;
-    setStatusMessage("He thong dang nghe am thanh...");
+    setStatusMessage(u8"Hệ thống đang nghe âm thanh...");
 }
 void loop(){
     uint32_t now = millis();
