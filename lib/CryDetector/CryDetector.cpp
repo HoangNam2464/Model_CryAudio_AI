@@ -33,3 +33,14 @@ bool CryDetector::update(float cry_prob){
     return crying;
 }
 bool CryDetector::isCrying(){ return crying; }
+
+void CryDetector::configure(float new_on_th, float new_off_th,
+                            float new_stable_on_s, float new_stable_off_s,
+                            float new_min_on_s, float new_min_off_s){
+    on_th = new_on_th;
+    off_th = new_off_th;
+    stable_on_s = new_stable_on_s;
+    stable_off_s = new_stable_off_s;
+    min_on_s = new_min_on_s;
+    min_off_s = new_min_off_s;
+}

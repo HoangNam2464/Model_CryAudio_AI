@@ -15,6 +15,9 @@ public:
     bool update(float cry_prob);
     bool isCrying();
     float score() const { return ema_score; }
+    void configure(float on_th, float off_th,
+                   float stable_on_s, float stable_off_s,
+                   float min_on_s, float min_off_s);
 private:
     float on_th, off_th, ema_alpha;
     float stable_on_s, stable_off_s;

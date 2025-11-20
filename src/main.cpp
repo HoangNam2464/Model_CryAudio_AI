@@ -7,6 +7,8 @@
 #include <cmath>
 #include <esp_system.h>
 #include <esp_log.h>
+#include <freertos/event_groups.h>
+#include <esp_task_wdt.h>
 
 #include "Config.h"
 #include "WifiConfig.h"
@@ -20,6 +22,23 @@
 #include "SpeechSamples.h"
 #endif
 
+#ifndef LOG_LEVEL
+#define LOG_LEVEL 2
+#endif
+
+enum LogVerbosity {
+    LOG_ERROR_LEVEL = 0,
+    LOG_WARN_LEVEL  = 1,
+    LOG_INFO_LEVEL  = 2,
+    LOG_DEBUG_LEVEL = 3
+};
+
+#define LOG_PRINT(level, fmt, ...) do { if (LOG_LEVEL >= level) Serial.printf(fmt, ##__VA_ARGS__); } while(0)
+#define LOGE(fmt, ...) LOG_PRINT(LOG_ERROR_LEVEL, fmt, ##__VA_ARGS__)
+#define LOGW(fmt, ...) LOG_PRINT(LOG_WARN_LEVEL, fmt, ##__VA_ARGS__)
+#define LOGI(fmt, ...) LOG_PRINT(LOG_INFO_LEVEL, fmt, ##__VA_ARGS__)
+#define LOGD(fmt, ...) LOG_PRINT(LOG_DEBUG_LEVEL, fmt, ##__VA_ARGS__)
+
 // ===== Globals exposed to API =====
 float g_lastProb  = 0.0f;
 float g_lastScore = 0.0f;
@@ -27,44 +46,57 @@ bool  g_isCrying  = false;
 double g_lastLat  = 0.0;
 double g_lastLng  = 0.0;
 bool   g_gpsValid = false;
-char   g_statusMessage[64] = "Đang khởi động hệ thống...";
+char   g_statusMessage[64] = "Dang khoi dong he thong...";
 
 // ===== FreeRTOS handles =====
 static TaskHandle_t hMicTask    = nullptr;
 static TaskHandle_t hInferTask  = nullptr;
 static TaskHandle_t hGpsTask    = nullptr;
 static TaskHandle_t hSendTask   = nullptr;
+static TaskHandle_t hWifiTask   = nullptr;
 static QueueHandle_t qPcm       = nullptr;
+static QueueHandle_t qPcmFree   = nullptr;
 static QueueHandle_t qEvents    = nullptr;
+static constexpr uint32_t REMIND_INTERVAL_MS = 180000; // 3 phút
 #if USE_MAX98357A_SPK
 static QueueHandle_t qSpeaker   = nullptr;
 enum class SpeakCmd : uint8_t { Cry, Calm, NightOn, NightOff, Ting };
-static constexpr uint32_t REMIND_INTERVAL_MS = 180000; // 3 phút
-bool nightMode = false; // bật chế độ đêm nếu cần
-static uint32_t g_lastCryChangeMs = 0;
 #endif
+bool nightMode = false; // bat che do dem neu can
+static uint32_t g_lastCryChangeMs = 0;
+static uint32_t g_lastCryReminderMs = 0;
+static EventGroupHandle_t g_wifiEventGroup = nullptr;
+static constexpr EventBits_t WIFI_READY_BIT = BIT0;
+static constexpr uint32_t WIFI_BACKOFF_MIN_MS = 1000;
+static constexpr uint32_t WIFI_BACKOFF_MAX_MS = 10000;
+static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
+static constexpr uint32_t PCM_POOL_BUFFERS = 12;
+static constexpr uint32_t CRY_HEARTBEAT_INTERVAL_MS = 15000;
 static bool g_setupApActive = false;
 static String g_setupApSsid;
 static bool g_wifiReconnectRequest = false;
 static constexpr const char* CONFIG_AP_PASS = "crysetup";
 static WiFiEventId_t g_wifiEventId = 0;
 static uint8_t g_wifiFailCount = 0;
-static uint32_t g_nextWifiRetryMs = 0;
 static uint8_t g_lastWifiReason = WIFI_REASON_UNSPECIFIED;
 static bool g_wifiConnected = false;
+static bool g_wifiPausedAfterFail = false;
 const char* g_lastEvent = "idle";
 uint32_t g_lastEventTs = 0;
 static bool g_btnPrev = true;
 static uint32_t g_btnLastMs = 0;
+static uint32_t g_lastHeartbeatReportMs = 0;
 
 struct CryEvent {
     bool crying;
+    bool heartbeat;
     float prob;
     float score;
     double lat;
     double lng;
     bool gpsValid;
     uint32_t tsMs;
+    uint32_t durationMs;
 };
 
 // ===== Cry debouncer =====
@@ -76,12 +108,81 @@ static CryDetector detector(
     INFER_INTERVAL_S
 );
 
+struct DetectorProfile {
+    float onTh;
+    float offTh;
+    float stableOn;
+    float stableOff;
+    float minOn;
+    float minOff;
+};
+
+static constexpr DetectorProfile DAY_PROFILE{
+    0.70f, 0.18f,
+    1.0f, 2.3f,
+    2.0f, 1.5f
+};
+
+static constexpr DetectorProfile NIGHT_PROFILE{
+    0.78f, 0.22f,
+    1.5f, 2.8f,
+    2.5f, 2.0f
+};
+
 static void setStatusMessage(const char* msg){
     if (!msg) return;
     size_t len = strlen(msg);
     if (len >= sizeof(g_statusMessage)) len = sizeof(g_statusMessage)-1;
     memcpy(g_statusMessage, msg, len);
     g_statusMessage[len] = '\0';
+}
+
+static void applyDetectorProfile(){
+    const DetectorProfile& profile = nightMode ? NIGHT_PROFILE : DAY_PROFILE;
+    detector.configure(profile.onTh, profile.offTh,
+                       profile.stableOn, profile.stableOff,
+                       profile.minOn, profile.minOff);
+}
+
+static void* audio_malloc(size_t bytes){
+    void* ptr = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr){
+        ptr = heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    }
+    return ptr;
+}
+
+static bool initPcmPool(){
+    if (qPcmFree){
+        return true;
+    }
+    qPcmFree = xQueueCreate(PCM_POOL_BUFFERS, sizeof(int16_t*));
+    if (!qPcmFree){
+        return false;
+    }
+    for (uint32_t i=0; i<PCM_POOL_BUFFERS; ++i){
+        int16_t* buf = static_cast<int16_t*>(audio_malloc(I2S_READ_LEN * sizeof(int16_t)));
+        if (!buf){
+            return false;
+        }
+        xQueueSend(qPcmFree, &buf, 0);
+    }
+    return true;
+}
+
+static inline int16_t* acquirePcmBlock(TickType_t timeoutTicks){
+    int16_t* block = nullptr;
+    if (qPcmFree && xQueueReceive(qPcmFree, &block, timeoutTicks) == pdTRUE){
+        return block;
+    }
+    return nullptr;
+}
+
+static inline void releasePcmBlock(int16_t* block){
+    if (!block) return;
+    if (!qPcmFree || xQueueSend(qPcmFree, &block, 0) != pdTRUE){
+        heap_caps_free(block);
+    }
 }
 
 static void ensure_setup_ap(){
@@ -91,7 +192,7 @@ static void ensure_setup_ap(){
     g_setupApSsid = String("AudioCry-Setup-") + suffix;
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(g_setupApSsid.c_str(), CONFIG_AP_PASS);
-    Serial.printf("[WiFi] AP cấu hình bật: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
+    Serial.printf("[WiFi] AP c?u hình b?t: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
     g_setupApActive = true;
 }
 
@@ -99,6 +200,12 @@ static void stop_setup_ap(){
     if (!g_setupApActive) return;
     WiFi.softAPdisconnect(true);
     g_setupApActive = false;
+}
+
+static String get_setup_portal_url(){
+    if (!g_setupApActive) return String();
+    IPAddress ip = WiFi.softAPIP();
+    return String("http://") + ip.toString() + "/wifi";
 }
 
 static void updateWifiLed(){
@@ -118,6 +225,22 @@ static void blinkWifiLed(uint8_t times){
         vTaskDelay(pdMS_TO_TICKS(80));
     }
     updateWifiLed();
+}
+
+static void wifi_mark_connected(){
+    g_wifiConnected = true;
+    updateWifiLed();
+    if (g_wifiEventGroup){
+        xEventGroupSetBits(g_wifiEventGroup, WIFI_READY_BIT);
+    }
+}
+
+static void wifi_mark_disconnected(){
+    g_wifiConnected = false;
+    updateWifiLed();
+    if (g_wifiEventGroup){
+        xEventGroupClearBits(g_wifiEventGroup, WIFI_READY_BIT);
+    }
 }
 
 #if USE_MAX98357A_SPK
@@ -189,13 +312,23 @@ static void taskSpeaker(void*){
     }
 }
 
-static void speaker_enqueue(SpeakCmd cmd){
+static void speaker_clear_queue(){
+    if (!qSpeaker) return;
+    SpeakCmd tmp;
+    while (xQueueReceive(qSpeaker, &tmp, 0) == pdTRUE){
+        // discard pending audio commands to avoid spam
+    }
+}
+
+static void speaker_enqueue(SpeakCmd cmd, bool priority=false){
     if (!qSpeaker) return;
     static SpeakCmd lastCmd = SpeakCmd::Calm;
     static uint32_t lastMs = 0;
     uint32_t now = millis();
-    if (cmd == lastCmd && (now - lastMs) < 2000){
-        return; // bỏ qua lệnh trùng quá gần tránh spam
+    if (priority){
+        speaker_clear_queue();
+    } else if (cmd == lastCmd && (now - lastMs) < 2000){
+        return; // b? qua l?nh trùng quá g?n tránh spam
     }
     if (xQueueSend(qSpeaker, &cmd, 0) == pdTRUE){
         lastCmd = cmd;
@@ -208,10 +341,10 @@ static void speaker_enqueue(...) {}
 
 static const char* wifi_reason_to_text(uint8_t reason){
     switch(reason){
-        case WIFI_REASON_NO_AP_FOUND: return "không tìm thấy SSID";
-        case WIFI_REASON_AUTH_FAIL: return "sai mật khẩu";
-        case WIFI_REASON_BEACON_TIMEOUT: return "mất tín hiệu AP";
-        case WIFI_REASON_ASSOC_LEAVE: return "AP ngắt kết nối";
+        case WIFI_REASON_NO_AP_FOUND: return "không tìm th?y SSID";
+        case WIFI_REASON_AUTH_FAIL: return "sai m?t kh?u";
+        case WIFI_REASON_BEACON_TIMEOUT: return "m?t tín hi?u AP";
+        case WIFI_REASON_ASSOC_LEAVE: return "AP ng?t k?t n?i";
         default: return "lý do khác";
     }
 }
@@ -219,14 +352,14 @@ static const char* wifi_reason_to_text(uint8_t reason){
 static void handle_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info){
     switch(event){
         case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-            Serial.printf("[WiFi] Đã kết nối tới AP %s\n", WiFi.SSID().c_str());
+            Serial.printf("[WiFi] Ðã k?t n?i t?i AP %s\n", WiFi.SSID().c_str());
             g_wifiConnected = true;
             updateWifiLed();
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
             g_lastWifiReason = info.wifi_sta_disconnected.reason;
             if (info.wifi_sta_disconnected.reason != WIFI_REASON_NO_AP_FOUND){
-                Serial.printf("[WiFi] Mất kết nối (reason=%d - %s). Sẽ thử lại...\n",
+                Serial.printf("[WiFi] M?t k?t n?i (reason=%d - %s). S? th? l?i...\n",
                               info.wifi_sta_disconnected.reason,
                               wifi_reason_to_text(info.wifi_sta_disconnected.reason));
             }
@@ -250,8 +383,8 @@ static void i2s_init() {
     cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
     cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count = 4;
-    cfg.dma_buf_len = 512;
+    cfg.dma_buf_count = 8;
+    cfg.dma_buf_len = I2S_READ_LEN;
     cfg.use_apll = false;
     cfg.tx_desc_auto_clear = false;
     cfg.fixed_mclk = 0;
@@ -273,49 +406,58 @@ static void i2s_init() {
 
 // ===== MIC Task: read PCM blocks =====
 static void taskMic(void* arg) {
+    esp_task_wdt_add(nullptr);
     const size_t CHUNK = I2S_READ_LEN;
     size_t bytes_read = 0;
     uint32_t lastLog=0;
     uint32_t blocksOk=0;
     for(;;){
-        int16_t* block = static_cast<int16_t*>(heap_caps_malloc(CHUNK * sizeof(int16_t), MALLOC_CAP_8BIT));
+        int16_t* block = acquirePcmBlock(pdMS_TO_TICKS(50));
         if (!block){
+            esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
         esp_err_t err = i2s_read(I2S_NUM_0, block, CHUNK * sizeof(int16_t), &bytes_read, portMAX_DELAY);
         if (err != ESP_OK || bytes_read != CHUNK * sizeof(int16_t)) {
-            heap_caps_free(block);
+            releasePcmBlock(block);
             vTaskDelay(pdMS_TO_TICKS(2));
             continue;
         }
         if (xQueueSend(qPcm, &block, 0) != pdTRUE) {
-            heap_caps_free(block);
+            releasePcmBlock(block);
         }
         blocksOk++;
         uint32_t now = millis();
         if (now - lastLog > 10000){
             int16_t mid = block[CHUNK/2];
-            Serial.printf("[MIC] %u khối OK, mẫu giữa=%d\n", blocksOk, mid);
+            Serial.printf("[MIC] %u blocks OK, mid=%d\n", blocksOk, mid);
             lastLog = now;
             blocksOk=0;
         }
+        esp_task_wdt_reset();
     }
 }
-
 // ===== Infer Task =====
 static void taskInfer(void* arg) {
     const TickType_t delayTicks = (TickType_t)(INFER_INTERVAL_S*1000)/portTICK_PERIOD_MS;
     const size_t TARGET_SAMPLES = (size_t)(I2S_SAMPLE_RATE * INFER_INTERVAL_S);
-    int16_t* win = static_cast<int16_t*>(heap_caps_malloc(TARGET_SAMPLES * sizeof(int16_t), MALLOC_CAP_8BIT));
-    if (!win) {
-        Serial.println("Failed to allocate inference window buffer");
-        vTaskDelete(nullptr);
-        return;
+    int16_t* win = nullptr;
+    while (!win){
+        win = static_cast<int16_t*>(audio_malloc(TARGET_SAMPLES * sizeof(int16_t)));
+        if (!win){
+            LOGE("[AI] Failed to allocate inference window buffer, retrying...\n");
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
     }
     size_t filled = 0;
     bool prevState=false;
-    tflm_begin();
+    while (!tflm_begin()){
+        LOGE("[AI] Failed to init TFLM, retrying...\n");
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    esp_task_wdt_add(nullptr);
+    g_lastHeartbeatReportMs = millis();
 
     for(;;){
         while (filled < TARGET_SAMPLES){
@@ -324,59 +466,89 @@ static void taskInfer(void* arg) {
                 size_t copy = min(TARGET_SAMPLES - filled, (size_t)I2S_READ_LEN);
                 memcpy(win + filled, block, copy*sizeof(int16_t));
                 filled += copy;
-                heap_caps_free(block);
+                releasePcmBlock(block);
             } else {
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
+            esp_task_wdt_reset();
         }
         float prob = tflm_infer_prob(win, TARGET_SAMPLES);
         g_lastProb = prob;
         bool state = detector.update(prob);
         g_lastScore = detector.score();
         g_isCrying = state;
+        LOGI("[AI] prob=%.3f score=%.3f state=%s (night=%s)\n",
+             prob, g_lastScore, state ? "CRY" : "CALM", nightMode ? "ON" : "OFF");
 
+        uint32_t now = millis();
         if (state != prevState){
             GpsFix fix = gps_get_fix();
             g_lastLat = fix.lat; g_lastLng = fix.lng; g_gpsValid = fix.valid;
             updateCryLed(state);
             if (nightMode){
-                if (state){
-                    speaker_enqueue(SpeakCmd::Ting);
-                } else {
-                    speaker_enqueue(SpeakCmd::Ting);
-                }
+                speaker_enqueue(SpeakCmd::Ting);
             } else {
                 speaker_enqueue(state ? SpeakCmd::Cry : SpeakCmd::Calm);
             }
             CryEvent evt{};
             evt.crying = state;
+            evt.heartbeat = false;
             evt.prob = prob;
             evt.score = g_lastScore;
             evt.lat = g_lastLat;
             evt.lng = g_lastLng;
             evt.gpsValid = g_gpsValid;
-            evt.tsMs = millis();
+            evt.tsMs = now;
+            evt.durationMs = state ? 0 : (now - g_lastCryChangeMs);
             g_lastCryChangeMs = evt.tsMs;
+            g_lastCryReminderMs = evt.tsMs;
+            g_lastHeartbeatReportMs = evt.tsMs;
             g_lastEvent = state ? "cry_on" : "cry_off";
             g_lastEventTs = evt.tsMs;
+            Serial.printf("[AI] State change -> %s (prob=%.3f score=%.3f gps=%s lat=%.5f lng=%.5f)\n",
+                          state ? "CRY_ON" : "CRY_OFF",
+                          evt.prob, evt.score,
+                          evt.gpsValid ? "valid" : "invalid",
+                          evt.lat, evt.lng);
             if (xQueueSend(qEvents, &evt, pdMS_TO_TICKS(50)) != pdTRUE) {
                 Serial.println("Event queue full, dropping cry event");
             }
             prevState = state;
-        } else if (state && (millis() - g_lastCryChangeMs) > REMIND_INTERVAL_MS) {
-            g_lastCryChangeMs = millis();
-            if (nightMode){
-                speaker_enqueue(SpeakCmd::Ting);
-            } else {
-                speaker_enqueue(SpeakCmd::Cry);
+        } else {
+            if (state && (now - g_lastCryReminderMs) > REMIND_INTERVAL_MS) {
+                g_lastCryReminderMs = now;
+                Serial.println("[AI] Cry reminder trigger, still detecting cry state");
+                if (nightMode){
+                    speaker_enqueue(SpeakCmd::Ting);
+                } else {
+                    speaker_enqueue(SpeakCmd::Cry);
+                }
+            }
+            if (state && (now - g_lastHeartbeatReportMs) > CRY_HEARTBEAT_INTERVAL_MS){
+                CryEvent evt{};
+                evt.crying = true;
+                evt.heartbeat = true;
+                evt.prob = prob;
+                evt.score = g_lastScore;
+                evt.lat = g_lastLat;
+                evt.lng = g_lastLng;
+                evt.gpsValid = g_gpsValid;
+                evt.tsMs = now;
+                evt.durationMs = now - g_lastCryChangeMs;
+                if (xQueueSend(qEvents, &evt, pdMS_TO_TICKS(10)) != pdTRUE) {
+                    Serial.println("Heartbeat queue full, dropping cry heartbeat");
+                } else {
+                    g_lastHeartbeatReportMs = now;
+                }
             }
         }
         filled = 0;
+        esp_task_wdt_reset();
         vTaskDelay(delayTicks);
     }
 }
 
-// ===== GPS Task =====
+// ===== GPS Task =====// ===== GPS Task =====
 static void taskGps(void* arg){
     uint32_t lastLog=0;
     for(;;){
@@ -384,9 +556,9 @@ static void taskGps(void* arg){
         if (millis()-lastLog>10000){
             GpsFix fix = gps_get_fix();
             if (fix.valid){
-                Serial.printf("[GPS] lat=%.5f lng=%.5f tuổi=%lu ms\n", fix.lat, fix.lng, fix.age_ms);
+                Serial.printf("[GPS] lat=%.5f lng=%.5f tu?i=%lu ms\n", fix.lat, fix.lng, fix.age_ms);
             } else {
-                Serial.println("[GPS] Đang tìm vệ tinh...");
+                Serial.println("[GPS] Ðang tìm v? tinh...");
             }
             lastLog = millis();
         }
@@ -395,12 +567,27 @@ static void taskGps(void* arg){
 }
 
 static bool wifi_connect_blocking(){
+    if (g_wifiPausedAfterFail){
+        LOGW("[WiFi] Dang tam dung thu lai cho toi khi cau hinh moi.");
+        setStatusMessage("Dang dung AP cau hinh, vui long nhap WiFi moi.");
+        ensure_setup_ap();
+        wifi_mark_disconnected();
+        return false;
+    }
     WifiCredentials creds;
     wifi_config_load(creds);
     if (creds.ssid.isEmpty()){
-        Serial.println("[WiFi] Chưa có thông tin WiFi, bật AP cấu hình.");
-        setStatusMessage("Chưa cấu hình WiFi, kết nối AP để nhập.");
+        LOGW("[WiFi] Chua co thong tin WiFi, bat AP cau hinh.");
+        setStatusMessage("Chua cau hinh WiFi, ket noi AP de nhap.");
         ensure_setup_ap();
+        String portal = get_setup_portal_url();
+        if (portal.length()){
+            LOGI("[WiFi] Mo %s de nhap WiFi.\n", portal.c_str());
+            String msg = String("Chua co WiFi, mo ") + portal;
+            setStatusMessage(msg.c_str());
+        }
+        g_wifiPausedAfterFail = true;
+        wifi_mark_disconnected();
         return false;
     }
     if (g_wifiEventId == 0){
@@ -408,44 +595,60 @@ static bool wifi_connect_blocking(){
     }
     WiFi.mode(WIFI_AP_STA);
     WiFi.setSleep(true);
-    Serial.printf("[WiFi] Đang kết nối tới \"%s\"...\n", creds.ssid.c_str());
-    setStatusMessage("Đang chờ kết nối WiFi...");
+    LOGI("[WiFi] Dang ket noi toi \"%s\"...\n", creds.ssid.c_str());
+    setStatusMessage("Dang cho ket noi WiFi...");
     WiFi.begin(creds.ssid.c_str(), creds.pass.c_str());
     uint32_t t0=millis();
-    while (WiFi.status()!=WL_CONNECTED && millis()-t0<20000){
-        delay(300);
+    while (WiFi.status()!=WL_CONNECTED && millis()-t0<WIFI_CONNECT_TIMEOUT_MS){
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
     bool ok = WiFi.status()==WL_CONNECTED;
     if (ok){
-        Serial.print("[WiFi] Kết nối thành công, IP: ");
-        Serial.println(WiFi.localIP());
-        setStatusMessage("WiFi đã kết nối, đang khởi tạo...");
+        LOGI("[WiFi] Ket noi thanh cong, IP: %s\n", WiFi.localIP().toString().c_str());
+        String cfgUrl = String("http://") + WiFi.localIP().toString() + "/wifi";
+        LOGI("[WiFi] Trang cau hinh: %s\n", cfgUrl.c_str());
+        setStatusMessage("WiFi da ket noi, dang khoi tao...");
         g_wifiFailCount = 0;
-        g_nextWifiRetryMs = millis() + 5000;
-        g_wifiConnected = true;
-        updateWifiLed();
+        g_wifiPausedAfterFail = false;
+        wifi_mark_connected();
         stop_setup_ap();
     } else {
-        g_wifiFailCount = min<uint8_t>(g_wifiFailCount + 1, 10);
-        uint32_t backoff = 3000 * g_wifiFailCount;
-        Serial.printf("[WiFi] Kết nối thất bại (reason=%s). Sẽ thử lại sau %u giây.\n",
-                      wifi_reason_to_text(g_lastWifiReason), backoff/1000);
-        g_nextWifiRetryMs = millis() + backoff;
-        setStatusMessage("Không kết nối được WiFi, dùng AP cấu hình.");
-        g_wifiConnected = false;
-        updateWifiLed();
+        g_wifiFailCount = std::min<uint8_t>(g_wifiFailCount + 1, 10);
+        LOGW("[WiFi] Ket noi that bai (reason=%s).\n", wifi_reason_to_text(g_lastWifiReason));
+        wifi_mark_disconnected();
         ensure_setup_ap();
+        if (!g_wifiPausedAfterFail){
+            g_wifiPausedAfterFail = true;
+            LOGW("[WiFi] Tam ngung thu lai cho toi khi nhap WiFi moi hoac reboot.");
+        }
+        setStatusMessage("Khong ket noi duoc, vui long dung AP cau hinh.");
+        String portal = get_setup_portal_url();
+        if (portal.length()){
+            LOGI("[WiFi] Vui long mo %s de nhap lai WiFi.\n", portal.c_str());
+            String msg = String("Khong ket noi, mo ") + portal;
+            setStatusMessage(msg.c_str());
+        }
     }
     return ok;
 }
-
-static bool ensure_wifi(){
-    if (WiFi.status()==WL_CONNECTED) return true;
-    return wifi_connect_blocking();
+static bool ensure_wifi(uint32_t waitMs = 5000){
+    if (!g_wifiEventGroup){
+        return WiFi.status()==WL_CONNECTED;
+    }
+    EventBits_t bits = xEventGroupWaitBits(
+        g_wifiEventGroup,
+        WIFI_READY_BIT,
+        pdFALSE,
+        pdTRUE,
+        pdMS_TO_TICKS(waitMs)
+    );
+    return (bits & WIFI_READY_BIT);
 }
 
 void wifi_request_reconnect(){
+    g_wifiPausedAfterFail = false;
     g_wifiReconnectRequest = true;
+    wifi_mark_disconnected();
 }
 
 bool wifi_is_setup_ap_active(){
@@ -460,57 +663,114 @@ const char* wifi_get_setup_ap_pass(){
     return CONFIG_AP_PASS;
 }
 
+static void taskWifi(void*){
+    uint32_t backoffMs = WIFI_BACKOFF_MIN_MS;
+    for(;;){
+        if (g_wifiReconnectRequest){
+            g_wifiReconnectRequest = false;
+            g_wifiPausedAfterFail = false;
+            WiFi.disconnect(true, true);
+            wifi_mark_disconnected();
+            backoffMs = WIFI_BACKOFF_MIN_MS;
+        }
+        if (g_wifiPausedAfterFail){
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (WiFi.status()!=WL_CONNECTED){
+            bool ok = wifi_connect_blocking();
+            if (ok){
+                backoffMs = WIFI_BACKOFF_MIN_MS;
+            } else {
+                backoffMs = std::min(backoffMs * 2, WIFI_BACKOFF_MAX_MS);
+                vTaskDelay(pdMS_TO_TICKS(backoffMs));
+                continue;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
 static void taskSender(void* arg){
     CryEvent evt;
     for(;;){
         if (xQueueReceive(qEvents, &evt, portMAX_DELAY) != pdTRUE){
             continue;
         }
-        if (!ensure_wifi()){
-            Serial.println("WiFi unavailable, event skipped");
-            continue;
+        while (!ensure_wifi(15000)){
+            LOGW("[Send] WiFi unavailable, waiting to push event...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
         }
         String json = "{";
         json += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
-        json += "\"event\":\"" + String(evt.crying ? "cry_on" : "cry_off") + "\",";
+        const char* evtName = evt.heartbeat ? "cry_heartbeat" : (evt.crying ? "cry_on" : "cry_off");
+        json += "\"event\":\"" + String(evtName) + "\",";
         json += "\"prob\":" + String(evt.prob, 3) + ",";
         json += "\"score\":" + String(evt.score, 3) + ",";
         json += "\"lat\":" + String(evt.lat, 6) + ",";
         json += "\"lng\":" + String(evt.lng, 6) + ",";
         json += "\"gps_valid\":"; json += (evt.gpsValid ? "true" : "false"); json += ",";
+        json += "\"duration_ms\":" + String(evt.durationMs) + ",";
         json += "\"ts\":" + String(evt.tsMs);
         json += "}";
-        if (!RestClient::postJSON(BACKEND_URL, json)){
-            Serial.println("Failed to post cry event");
+        bool sent = false;
+        for (uint8_t attempt=0; attempt<3 && !sent; ++attempt){
+            if (RestClient::postJSON(BACKEND_URL, json)){
+                sent = true;
+            } else {
+                LOGW("[Send] Failed to post cry event attempt %u", attempt+1);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+            }
+        }
+        if (!sent){
+            LOGE("[Send] Dropping cry event after retries");
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-void setup(){
+static void initRuntime(){
     Serial.begin(115200); delay(200);
     esp_log_level_set("wifi", ESP_LOG_NONE);
     esp_log_level_set("WiFiGeneric", ESP_LOG_NONE);
     esp_log_level_set("WiFi", ESP_LOG_NONE);
+    esp_task_wdt_init(5, true);
     wifi_config_init();
     ensure_setup_ap();
-    setStatusMessage("Đang khởi động hệ thống...");
+    applyDetectorProfile();
+    if (!g_wifiEventGroup){
+        g_wifiEventGroup = xEventGroupCreate();
+        if (!g_wifiEventGroup){
+            Serial.println("[WiFi] Failed to create event group");
+        }
+    }
+    setStatusMessage("Dang khoi dong he thong...");
+}
+static void initGpioAndStatus(){
     pinMode(LED_WIFI_PIN, OUTPUT);
     pinMode(LED_CRY_RED_PIN, OUTPUT);
     pinMode(LED_CRY_GREEN_PIN, OUTPUT);
-    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
     updateWifiLed();
     updateCryLed(false);
-    wifi_connect_blocking();
-    api_begin();
-    i2s_init();
-    gps_begin();
+}
 
+static void initQueues(){
     qPcm = xQueueCreate(12, sizeof(int16_t*));
     qEvents = xQueueCreate(6, sizeof(CryEvent));
 #if USE_MAX98357A_SPK
     qSpeaker = xQueueCreate(4, sizeof(SpeakCmd));
 #endif
+    if (!qPcm || !qEvents){
+        Serial.println("[Init] Failed to allocate queues");
+    }
+    if (!initPcmPool()){
+        Serial.println("[Init] Failed to init PCM buffer pool");
+    }
+}
+
+static void startTasks(){
+    xTaskCreatePinnedToCore(taskWifi, "wifi", 4096, nullptr, 2, &hWifiTask, 0);
     xTaskCreatePinnedToCore(taskMic, "mic", 4096, nullptr, 2, &hMicTask, 0);
     xTaskCreatePinnedToCore(taskInfer, "infer", 8192, nullptr, 3, &hInferTask, 1);
     xTaskCreatePinnedToCore(taskGps, "gps", 3072, nullptr, 1, &hGpsTask, 1);
@@ -520,26 +780,21 @@ void setup(){
         xTaskCreatePinnedToCore(taskSpeaker, "speaker", 4096, nullptr, 1, nullptr, 1);
     }
 #endif
-    setStatusMessage("Hệ thống đang nghe âm thanh...");
 }
 
-void loop(){
-    static uint32_t lastCheck=0;
-    // handle BOOT button toggle for night mode (debounced, toggle once per press)
-    static bool rawPrev = true;      // GPIO0 có pull-up, nên mặc định HIGH (not pressed)
-    static bool stableState = true;  // true = không nhấn, false = nhấn
+static void handleModeButton(uint32_t now){
+    constexpr uint32_t DEBOUNCE_MS = 60;
+    constexpr uint32_t MIN_PRESS_MS = 120;
+    constexpr uint32_t MAX_PRESS_MS = 4000;
+    constexpr uint32_t TOGGLE_GAP_MS = 900;
+    constexpr uint32_t IGNORE_AFTER_RESET_MS = 1200;
+    static bool rawPrev = true;
+    static bool stableState = true;
     static uint32_t lastModeToggleMs = 0;
     static uint32_t pressStartMs = 0;
     static uint32_t lastChangeMs = 0;
-    const uint32_t DEBOUNCE_MS = 60;        // lọc nhiễu ngắn
-    const uint32_t MIN_PRESS_MS = 120;      // nhấn tối thiểu
-    const uint32_t MAX_PRESS_MS = 4000;     // nhấn tối đa (tránh giữ để flash)
-    const uint32_t TOGGLE_GAP_MS = 900;     // cách 2 lần toggle
-    const uint32_t IGNORE_AFTER_RESET_MS = 1200;
 
-    uint32_t now = millis();
-    bool rawNow = (digitalRead(BOOT_BUTTON_PIN) == LOW); // active low
-
+    bool rawNow = (digitalRead(MODE_BUTTON_PIN) == LOW);
     if (rawNow != rawPrev){
         rawPrev = rawNow;
         lastChangeMs = now;
@@ -547,36 +802,47 @@ void loop(){
     if ((now - lastChangeMs) > DEBOUNCE_MS && stableState != rawPrev){
         stableState = rawPrev;
         if (!stableState){
-            pressStartMs = now; // stable pressed
+            pressStartMs = now;
         } else {
             if (pressStartMs > 0){
                 uint32_t pressDur = now - pressStartMs;
-                if (now > IGNORE_AFTER_RESET_MS &&
-                    pressDur >= MIN_PRESS_MS && pressDur <= MAX_PRESS_MS &&
-                    (now - lastModeToggleMs) > TOGGLE_GAP_MS) {
+                bool canToggle = (now > IGNORE_AFTER_RESET_MS) &&
+                                 (pressDur >= MIN_PRESS_MS && pressDur <= MAX_PRESS_MS) &&
+                                 ((now - lastModeToggleMs) > TOGGLE_GAP_MS);
+                if (canToggle){
                     nightMode = !nightMode;
                     lastModeToggleMs = now;
                     Serial.printf("[MODE] nightMode=%s\n", nightMode ? "ON" : "OFF");
+                    applyDetectorProfile();
                     blinkWifiLed(nightMode ? 2 : 1);
-                    speaker_enqueue(nightMode ? SpeakCmd::NightOn : SpeakCmd::NightOff);
+                    speaker_enqueue(nightMode ? SpeakCmd::NightOn : SpeakCmd::NightOff, true);
                 }
             }
             pressStartMs = 0;
         }
     }
-    if (g_wifiReconnectRequest){
-        g_wifiReconnectRequest=false;
-        wifi_connect_blocking();
-    }
-    if (now - lastCheck>1000){
-        if (WiFi.status()!=WL_CONNECTED && now >= g_nextWifiRetryMs) {
-            wifi_connect_blocking();
-        }
-        lastCheck=now;
-    }
+}
+
+void setup(){
+    initRuntime();
+    initGpioAndStatus();
+    api_begin();
+    i2s_init();
+    gps_begin();
+    initQueues();
+    startTasks();
+    g_wifiReconnectRequest = true;
+    setStatusMessage("He thong dang nghe am thanh...");
+}
+void loop(){
+    uint32_t now = millis();
+    handleModeButton(now);
+
     api_loop();
     delay(5);
 }
+
+
 
 
 

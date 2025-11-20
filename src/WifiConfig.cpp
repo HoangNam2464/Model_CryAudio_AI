@@ -34,3 +34,9 @@ bool wifi_config_has_credentials(){
     ensurePrefs();
     return prefs.isKey("ssid");
 }
+
+void wifi_config_clear(){
+    ensurePrefs();
+    if (prefs.isKey("ssid")) prefs.remove("ssid");
+    if (prefs.isKey("pass")) prefs.remove("pass");
+}

@@ -24,30 +24,30 @@
 #define INFER_INTERVAL_S             2.0f
 
 /* ============================================================
- *  INMP441 (I2S0 trên ESP32 DevKit 30 chân)
+ *  INMP441 (I2S RX – theo AI XiaoZhi)
  *
  *  Đấu dây:
- *     WS/LRCL  -> GPIO25  (D25)
- *     BCLK     -> GPIO26  (D26)
- *     DATA OUT -> GPIO22  (D22)
+ *     WS/LRCL  -> GPIO25
+ *     BCLK     -> GPIO26
+ *     DATA OUT -> GPIO32
  * ============================================================ */
 #define MIC_I2S_PORT           I2S_NUM_0
 #define MIC_I2S_GPIO_WS        GPIO_NUM_25
-#define MIC_I2S_GPIO_BCLK      GPIO_NUM_26
-#define MIC_I2S_GPIO_DATA_IN   GPIO_NUM_22
+#define MIC_I2S_GPIO_SCK       GPIO_NUM_26
+#define MIC_I2S_GPIO_DATA_IN   GPIO_NUM_32
 
 /* ============================================================
- *  Loa MAX98357A (I2S0 TX)
+ *  Loa MAX98357A (I2S TX – theo AI XiaoZhi)
  *
  *  Đấu dây:
- *     BCLK -> GPIO26 (chung clock với mic)
- *     LRC  -> GPIO25 (chung WS với mic)
- *     DIN  -> GPIO27 (D27)
+ *     DIN  -> GPIO33
+ *     BCLK -> GPIO14
+ *     LRC  -> GPIO27
  * ============================================================ */
 #define SPK_I2S_PORT           I2S_NUM_0
-#define SPK_I2S_GPIO_BCLK      GPIO_NUM_26
-#define SPK_I2S_GPIO_LRCLK     GPIO_NUM_25
-#define SPK_I2S_GPIO_DATA_OUT  GPIO_NUM_27
+#define SPK_I2S_GPIO_DATA_OUT  GPIO_NUM_33
+#define SPK_I2S_GPIO_BCLK      GPIO_NUM_14
+#define SPK_I2S_GPIO_LRCLK     GPIO_NUM_27
 
 /* ============================================================
  *  GPS NEO-6M (UART2)
@@ -63,7 +63,7 @@
 #define LED_WIFI_GPIO          GPIO_NUM_2
 #define LED_CRY_RED_GPIO       GPIO_NUM_4
 #define LED_CRY_GREEN_GPIO     GPIO_NUM_5
-#define BOOT_BUTTON_GPIO       GPIO_NUM_0
+#define MODE_BUTTON_GPIO       GPIO_NUM_13
 
 /* ============================================================
  *  I2C BUS (tùy chọn)
