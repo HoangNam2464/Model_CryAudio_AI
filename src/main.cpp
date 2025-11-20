@@ -352,15 +352,13 @@ static const char* wifi_reason_to_text(uint8_t reason){
 static void handle_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info){
     switch(event){
         case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-            LOGI(u8"[WiFi] Đã kết nối tới AP %s
-", WiFi.SSID().c_str());
+            LOGI(u8"[WiFi] Đã kết nối tới AP %s\n", WiFi.SSID().c_str());
             wifi_mark_connected();
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
             g_lastWifiReason = info.wifi_sta_disconnected.reason;
             if (info.wifi_sta_disconnected.reason != WIFI_REASON_NO_AP_FOUND){
-                LOGW(u8"[WiFi] Mất kết nối (reason=%d - %s). Sẽ thử lại...
-",
+                LOGW(u8"[WiFi] Mất kết nối (reason=%d - %s). Sẽ thử lại...\n",
                      info.wifi_sta_disconnected.reason,
                      wifi_reason_to_text(info.wifi_sta_disconnected.reason));
             }
