@@ -23,7 +23,7 @@
 #endif
 
 #ifndef LOG_LEVEL
-#define LOG_LEVEL 2
+#define LOG_LEVEL 3
 #endif
 
 enum LogVerbosity {
@@ -89,6 +89,7 @@ static uint32_t g_btnLastMs = 0;
 static uint32_t g_lastHeartbeatReportMs = 0;
 static int16_t* g_inferWindow = nullptr;
 static uint32_t g_lastInferAllocLogMs = 0;
+static uint32_t g_pcmBuffersAllocated = 0;
 
 struct CryEvent {
     bool crying;
@@ -169,6 +170,7 @@ static bool ensure_infer_window(){
         }
         return false;
     }
+    LOGI("[AI] Inference buffer ready (%u samples)\n", (unsigned)(bytes / sizeof(int16_t)));
     return true;
 }
 
@@ -189,6 +191,12 @@ static bool initPcmPool(){
         xQueueSend(qPcmFree, &buf, 0);
         allocated++;
     }
+    g_pcmBuffersAllocated = allocated;
+    if (allocated > 0){
+        LOGI("[Init] Allocated %u PCM buffers\n", allocated);
+    } else {
+        LOGE("[Init] Failed to allocate PCM buffers");
+    }
     return allocated > 0;
 }
 
@@ -207,15 +215,40 @@ static inline void releasePcmBlock(int16_t* block){
     }
 }
 
+static String get_setup_portal_url(){
+    if (!g_setupApActive) return String();
+    IPAddress ip = WiFi.softAPIP();
+    return String("http://") + ip.toString() + "/wifi";
+}
+
+static void log_setup_portal_link(const char* prefix=nullptr){
+    if (!g_setupApActive) return;
+    String link = get_setup_portal_url();
+    if (!link.length()) return;
+    if (prefix && *prefix){
+        LOGI("[WiFi] %s -> %s\n", prefix, link.c_str());
+    } else {
+        LOGI("[WiFi] Setup portal: %s\n", link.c_str());
+    }
+}
+
 static void ensure_setup_ap(){
     if (g_setupApActive) return;
     char suffix[7];
     snprintf(suffix, sizeof(suffix), "%04X", (uint16_t)(ESP.getEfuseMac() & 0xFFFF));
     g_setupApSsid = String("AudioCry-Setup-") + suffix;
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(g_setupApSsid.c_str(), CONFIG_AP_PASS);
-    Serial.printf("[WiFi] AP cấu hình bật: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
-    g_setupApActive = true;
+    // Đặt IP mặc định cho AP để tránh xung đột DHCP.
+    WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+    // Cố định kênh 1, max 4 client để thiết bị dễ kết nối.
+    bool apOk = WiFi.softAP(g_setupApSsid.c_str(), CONFIG_AP_PASS, 1, 0, 4, false);
+    if (apOk){
+        Serial.printf("[WiFi] Setup AP enabled: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
+        g_setupApActive = true;
+        log_setup_portal_link("Open setup portal");
+    } else {
+        Serial.println("[WiFi] Failed to start setup AP");
+    }
 }
 
 static void stop_setup_ap(){
@@ -224,14 +257,13 @@ static void stop_setup_ap(){
     g_setupApActive = false;
 }
 
-static String get_setup_portal_url(){
-    if (!g_setupApActive) return String();
-    IPAddress ip = WiFi.softAPIP();
-    return String("http://") + ip.toString() + "/wifi";
-}
 
 static void updateWifiLed(){
+#if LED_WIFI_ACTIVE_LOW
+    digitalWrite(LED_WIFI_PIN, g_wifiConnected ? LOW : HIGH);
+#else
     digitalWrite(LED_WIFI_PIN, g_wifiConnected ? HIGH : LOW);
+#endif
 }
 
 static void updateCryLed(bool crying){
@@ -252,6 +284,13 @@ static void blinkWifiLed(uint8_t times){
 static void wifi_mark_connected(){
     g_wifiConnected = true;
     updateWifiLed();
+    if (WiFi.status() == WL_CONNECTED){
+        LOGI("[WiFi] Link active: SSID=%s IP=%s\n",
+             WiFi.SSID().c_str(),
+             WiFi.localIP().toString().c_str());
+    } else {
+        LOGI("[WiFi] Link active\n");
+    }
     if (g_wifiEventGroup){
         xEventGroupSetBits(g_wifiEventGroup, WIFI_READY_BIT);
     }
@@ -260,6 +299,9 @@ static void wifi_mark_connected(){
 static void wifi_mark_disconnected(){
     g_wifiConnected = false;
     updateWifiLed();
+    ensure_setup_ap();
+    log_setup_portal_link("WiFi not connected");
+    LOGW("[WiFi] Link inactive (reason=%u)", g_lastWifiReason);
     if (g_wifiEventGroup){
         xEventGroupClearBits(g_wifiEventGroup, WIFI_READY_BIT);
     }
@@ -446,6 +488,7 @@ static void taskMic(void* arg) {
         }
         if (xQueueSend(qPcm, &block, 0) != pdTRUE) {
             releasePcmBlock(block);
+            LOGW("[MIC] qPcm full, dropping block");
         }
         blocksOk++;
         uint32_t now = millis();
@@ -454,6 +497,8 @@ static void taskMic(void* arg) {
             Serial.printf("[MIC] %u blocks OK, mid=%d\n", blocksOk, mid);
             lastLog = now;
             blocksOk=0;
+        } else if ((blocksOk % 50) == 0){
+            LOGD("[MIC] queued %u blocks", blocksOk);
         }
         esp_task_wdt_reset();
     }
@@ -467,6 +512,7 @@ static void taskInfer(void* arg) {
     int16_t* win = g_inferWindow;
     size_t filled = 0;
     bool prevState=false;
+    uint32_t lastIdleLog=0;
     while (!tflm_begin()){
         LOGE("[AI] Failed to init TFLM, retrying...\n");
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -484,9 +530,15 @@ static void taskInfer(void* arg) {
                 releasePcmBlock(block);
             } else {
                 vTaskDelay(pdMS_TO_TICKS(2));
+                uint32_t nowWait = millis();
+                if (nowWait - lastIdleLog > 1000){
+                    LOGD("[AI] waiting for PCM data (%u/%u)", (unsigned)filled, (unsigned)TARGET_SAMPLES);
+                    lastIdleLog = nowWait;
+                }
             }
             esp_task_wdt_reset();
         }
+        LOGD("[AI] running inference on %u samples", (unsigned)TARGET_SAMPLES);
         float prob = tflm_infer_prob(win, TARGET_SAMPLES);
         g_lastProb = prob;
         bool state = detector.update(prob);
@@ -554,6 +606,7 @@ static void taskInfer(void* arg) {
                     Serial.println("Heartbeat queue full, dropping cry heartbeat");
                 } else {
                     g_lastHeartbeatReportMs = now;
+                    LOGD("[AI] queued heartbeat event");
                 }
             }
         }
@@ -583,8 +636,8 @@ static void taskGps(void* arg){
 
 static bool wifi_connect_blocking(){
     if (g_wifiPausedAfterFail){
-        LOGW("[WiFi] Đang tạm dừng thử lại cho tới khi cấu hình mới.");
-        setStatusMessage("Đang dùng AP cấu hình, vui lòng nhập WiFi mới.");
+        LOGW("[WiFi] Reconnect paused until new config.");
+        setStatusMessage("Đang dừng AP cấu hình, vui lòng nhập WiFi mới.");
         ensure_setup_ap();
         wifi_mark_disconnected();
         return false;
@@ -592,15 +645,10 @@ static bool wifi_connect_blocking(){
     WifiCredentials creds;
     wifi_config_load(creds);
     if (creds.ssid.isEmpty()){
-        LOGW("[WiFi] Chưa có thông tin WiFi, bật AP cấu hình.");
+        LOGW("[WiFi] No saved WiFi, keeping setup AP active.");
         setStatusMessage("Chưa cấu hình WiFi, kết nối AP để nhập.");
         ensure_setup_ap();
-        String portal = get_setup_portal_url();
-        if (portal.length()){
-            LOGI("[WiFi] Mở %s để nhập WiFi.\n", portal.c_str());
-            String msg = String("Chưa có WiFi, mở ") + portal;
-            setStatusMessage(msg.c_str());
-        }
+        log_setup_portal_link("Nhập WiFi tại");
         g_wifiPausedAfterFail = true;
         wifi_mark_disconnected();
         return false;
@@ -613,12 +661,13 @@ static bool wifi_connect_blocking(){
     LOGI("[WiFi] Đang kết nối tới \"%s\"...\n", creds.ssid.c_str());
     setStatusMessage("Đang chờ kết nối WiFi...");
     WiFi.begin(creds.ssid.c_str(), creds.pass.c_str());
-    uint32_t t0=millis();
+    uint32_t t0 = millis();
     while (WiFi.status()!=WL_CONNECTED && millis()-t0<WIFI_CONNECT_TIMEOUT_MS){
         vTaskDelay(pdMS_TO_TICKS(300));
     }
     bool ok = WiFi.status()==WL_CONNECTED;
     if (ok){
+        stop_setup_ap();
         LOGI("[WiFi] Kết nối thành công, IP: %s\n", WiFi.localIP().toString().c_str());
         String cfgUrl = String("http://") + WiFi.localIP().toString() + "/wifi";
         LOGI("[WiFi] Trang cấu hình: %s\n", cfgUrl.c_str());
@@ -626,26 +675,20 @@ static bool wifi_connect_blocking(){
         g_wifiFailCount = 0;
         g_wifiPausedAfterFail = false;
         wifi_mark_connected();
-        stop_setup_ap();
     } else {
         g_wifiFailCount = std::min<uint8_t>(g_wifiFailCount + 1, 10);
-        LOGW("[WiFi] Kết nối thất bại (reason=%s).\n", wifi_reason_to_text(g_lastWifiReason));
+        LOGW("[WiFi] Ket noi that bai (reason=%s).\n", wifi_reason_to_text(g_lastWifiReason));
         wifi_mark_disconnected();
         ensure_setup_ap();
         if (!g_wifiPausedAfterFail){
             g_wifiPausedAfterFail = true;
-            LOGW("[WiFi] Tạm ngưng thử lại cho tới khi nhập WiFi mới hoặc reboot.");
+            LOGW("[WiFi] Tạm ngừng thử lại cho tới khi nhập WiFi mới hoặc reboot.");
         }
-        setStatusMessage("Không kết nối được, vui lòng dùng AP cấu hình.");
-        String portal = get_setup_portal_url();
-        if (portal.length()){
-            LOGI("[WiFi] Vui lòng mở %s để nhập lại WiFi.\n", portal.c_str());
-            String msg = String("Không kết nối, mở ") + portal;
-            setStatusMessage(msg.c_str());
-        }
+        setStatusMessage("Không kết nối được, vui lòng dừng AP cấu hình.");
     }
     return ok;
 }
+
 static bool ensure_wifi(uint32_t waitMs = 5000){
     if (!g_wifiEventGroup){
         return WiFi.status()==WL_CONNECTED;
@@ -664,6 +707,13 @@ void wifi_request_reconnect(){
     g_wifiPausedAfterFail = false;
     g_wifiReconnectRequest = true;
     wifi_mark_disconnected();
+    ensure_setup_ap();
+    log_setup_portal_link("Reconnect via");
+    String portal = get_setup_portal_url();
+    if (portal.length()){
+        String msg = String("Mở ") + portal + " để kết nối lại.";
+        setStatusMessage(msg.c_str());
+    }
 }
 
 bool wifi_is_setup_ap_active(){
@@ -696,12 +746,15 @@ static void taskWifi(void*){
             bool ok = wifi_connect_blocking();
             if (ok){
                 backoffMs = WIFI_BACKOFF_MIN_MS;
+                LOGI("[WiFiTask] Connected, sleeping 200ms\n");
             } else {
                 backoffMs = std::min(backoffMs * 2, WIFI_BACKOFF_MAX_MS);
+                LOGW("[WiFiTask] Retry scheduled in %u ms", backoffMs);
                 vTaskDelay(pdMS_TO_TICKS(backoffMs));
                 continue;
             }
         }
+        LOGD("[WiFiTask] Link healthy");
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
@@ -728,10 +781,13 @@ static void taskSender(void* arg){
         json += "\"duration_ms\":" + String(evt.durationMs) + ",";
         json += "\"ts\":" + String(evt.tsMs);
         json += "}";
+        LOGI("[Send] event=%s prob=%.2f score=%.2f duration=%lu\n",
+             evtName, evt.prob, evt.score, static_cast<unsigned long>(evt.durationMs));
         bool sent = false;
         for (uint8_t attempt=0; attempt<3 && !sent; ++attempt){
             if (RestClient::postJSON(BACKEND_URL, json)){
                 sent = true;
+                LOGD("[Send] event delivered on attempt %u", attempt+1);
             } else {
                 LOGW("[Send] Gửi sự kiện thất bại lần %u", attempt+1);
                 vTaskDelay(pdMS_TO_TICKS(2000));
@@ -760,6 +816,7 @@ static void initRuntime(){
         }
     }
     setStatusMessage("Đang khởi động hệ thống...");
+    LOGI("[Init] Runtime initialized\n");
 }
 static void initGpioAndStatus(){
     pinMode(LED_WIFI_PIN, OUTPUT);
@@ -785,6 +842,8 @@ static void initQueues(){
     if (!ensure_infer_window()){
         Serial.println("[Init] Inference buffer not ready yet, will retry in task");
     }
+    LOGI("[Init] Queues ready (PCM=%u buffers, events=%u slots)\n",
+         g_pcmBuffersAllocated, uxQueueSpacesAvailable(qEvents));
 }
 
 static void startTasks(){

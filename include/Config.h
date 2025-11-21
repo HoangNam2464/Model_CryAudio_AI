@@ -58,6 +58,10 @@
 #define LED_CRY_GREEN_PIN   5
 #define MODE_BUTTON_PIN     13
 
+#ifndef LED_WIFI_ACTIVE_LOW
+#define LED_WIFI_ACTIVE_LOW 0  // 0 = active HIGH (đèn tắt khi chưa kết nối STA, sáng khi đã kết nối)
+#endif
+
 /* ============================================================
  *  I2C (OLED / SENSOR)
  * ============================================================ */
