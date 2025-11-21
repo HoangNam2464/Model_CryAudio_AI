@@ -22,6 +22,11 @@ void wifi_config_load(WifiCredentials& creds){
     ensurePrefs();
     creds.ssid = prefs.getString("ssid", "");
     creds.pass = prefs.getString("pass", "");
+    // fallback sang macro cấu hình nếu chưa từng lưu
+    if (creds.ssid.isEmpty() && strlen(WIFI_SSID) > 0){
+        creds.ssid = WIFI_SSID;
+        creds.pass = WIFI_PASS;
+    }
 }
 
 void wifi_config_save(const WifiCredentials& creds){

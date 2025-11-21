@@ -21,7 +21,8 @@
 #define AUDIO_BITS_PER_SAMPLE_TX     I2S_BITS_PER_SAMPLE_16BIT
 
 #define I2S_READ_SAMPLES             1024
-#define INFER_INTERVAL_S             2.0f
+// cửa sổ infer 1s để giảm RAM
+#define INFER_INTERVAL_S             1.0f
 
 /* ============================================================
  *  INMP441 (I2S RX – theo AI XiaoZhi)

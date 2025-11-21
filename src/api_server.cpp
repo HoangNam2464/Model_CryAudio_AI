@@ -4,6 +4,7 @@
 
 #include "Config.h"
 #include "WifiConfig.h"
+#include "wifi_service.h"
 
 extern float g_lastProb;
 extern float g_lastScore;
@@ -15,10 +16,6 @@ extern char   g_statusMessage[64];
 extern bool   nightMode;
 extern const char* g_lastEvent;
 extern uint32_t g_lastEventTs;
-extern void wifi_request_reconnect();
-extern bool wifi_is_setup_ap_active();
-extern const char* wifi_get_setup_ap_ssid();
-extern const char* wifi_get_setup_ap_pass();
 
 static WebServer server(80);
 

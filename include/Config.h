@@ -3,8 +3,8 @@
 /* ============================================================
  *  Cấu hình WiFi (để trống nếu dùng portal cấu hình)
  * ============================================================ */
-#define WIFI_SSID      ""
-#define WIFI_PASS      ""
+#define WIFI_SSID      "Xom Tro"
+#define WIFI_PASS      "0348791652"
 
 /* ============================================================
  *  Cấu hình Backend
@@ -26,7 +26,8 @@
 #define I2S_SAMPLE_RATE    16000
 #define I2S_READ_LEN       1024
 #define I2S_BITS_PER_SAMP  16
-#define INFER_INTERVAL_S   2.0f
+// Giảm cửa sổ infer xuống 1s để tiết kiệm RAM (16k mẫu ~ 32 KB)
+#define INFER_INTERVAL_S   1.0f
 
 /* ============================================================
  *  Loa MAX98357A I2S (TX)
@@ -56,7 +57,7 @@
 #define LED_WIFI_PIN        2  
 #define LED_CRY_RED_PIN     4
 #define LED_CRY_GREEN_PIN   5
-#define MODE_BUTTON_PIN     13
+#define MODE_BUTTON_PIN     13  // dùng nút rời, kéo lên bằng INPUT_PULLUP, nhấn kéo xuống GND
 
 #ifndef LED_WIFI_ACTIVE_LOW
 #define LED_WIFI_ACTIVE_LOW 0  // 0 = active HIGH (đèn tắt khi chưa kết nối STA, sáng khi đã kết nối)

@@ -19,7 +19,8 @@
 
 namespace {
 
-constexpr size_t kTensorArenaSize = 150 * 1024;  // adjust if AllocateTensors fails
+// Giảm arena để tiết kiệm RAM; tăng nếu AllocateTensors vẫn fail
+constexpr size_t kTensorArenaSize = 100 * 1024;  // 100 KB
 constexpr size_t kFeatureCount = kMelBins * kMelFrames;
 
 uint8_t* g_tensor_arena = nullptr;
@@ -136,6 +137,7 @@ bool tflm_begin() {
                 heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         }
         if (!g_tensor_arena) {
+            Serial.printf("[AI] Failed to alloc tensor arena (%u bytes)\n", (unsigned)kTensorArenaSize);
             return false;
         }
     }
@@ -148,6 +150,7 @@ bool tflm_begin() {
                 heap_caps_malloc(kFeatureCount * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         }
         if (!g_mel_buffer) {
+            Serial.printf("[AI] Failed to alloc mel buffer (%u bytes)\n", (unsigned)(kFeatureCount * sizeof(float)));
             return false;
         }
     }
@@ -160,6 +163,7 @@ bool tflm_begin() {
     }
 
     if (s_interpreter->AllocateTensors() != kTfLiteOk) {
+        Serial.println("[AI] AllocateTensors failed");
         return false;
     }
 
