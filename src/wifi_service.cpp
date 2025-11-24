@@ -330,7 +330,7 @@ const char *wifi_get_setup_ap_pass()
 static void taskWifi(void *)
 {
     uint32_t backoffMs = WIFI_BACKOFF_MIN_MS;
-    LOGI("[WiFiTask] start");
+    LOGI("[WiFiTask] start\n");
     for (;;)
     {
         if (g_wifiReconnectRequest)
@@ -362,7 +362,13 @@ static void taskWifi(void *)
                 continue;
             }
         }
-        LOGD("[WiFiTask] Link healthy");
+        static uint32_t lastLog = 0;
+        uint32_t now = millis();
+        if (now - lastLog > 5000) // log tối đa mỗi 5 giây
+        {
+            LOGD("[WiFiTask] Link healthy");
+            lastLog = now;
+        }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }

@@ -1,12 +1,13 @@
 #pragma once
-#include <stdint.h>
+#include <cstddef>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+// Model data (quantized TFLite)
 extern const unsigned char crynet_int8_tflite[];
-extern const unsigned int crynet_int8_tflite_len;
+extern const std::size_t crynet_int8_tflite_len;
 
 #ifdef __cplusplus
 }
