@@ -3,14 +3,15 @@
 
 #include <driver/gpio.h>
 #include <driver/i2s.h>
+#include "Config.h"
 
 /* ============================================================
  *  ĐÃ CHUYỂN SANG ESP32-S3 30-PIN
  * ============================================================ */
 #define USE_INMP441_MIC        1   // Mic INMP441 I2S RX
 #define USE_MAX98357A_SPK      1   // Amp MAX98357A I2S TX
-#define USE_GPS_NEO6M          1   // GPS NEO-6M UART
-#define USE_OLED_I2C           0   // Mặc định chưa gắn OLED
+#define USE_GPS_NEO6M          1   // GPS NEO-6M UART1
+#define USE_OLED_I2C           0   // Chưa gắn OLED
 
 /* ============================================================
  *  Âm thanh / AI
@@ -21,62 +22,50 @@
 #define AUDIO_BITS_PER_SAMPLE_TX     I2S_BITS_PER_SAMPLE_16BIT
 
 #define I2S_READ_SAMPLES             1024
-// cửa sổ infer 2s đầy đủ
+#ifndef INFER_INTERVAL_S
 #define INFER_INTERVAL_S             2.0f
+#endif
 
 /* ============================================================
  *  INMP441 (I2S RX – theo AI XiaoZhi)
- *
- *  Đấu dây (module): WS/LRCL, BCLK, DOUT
- *  ĐÃ CHUYỂN SANG ESP32-S3 30-PIN:
- *     WS/LRCL  -> GPIO7
- *     BCLK     -> GPIO6
- *     DATA OUT -> GPIO5
+ *  WS=GPIO4, BCLK=GPIO5, DATA=GPIO6
  * ============================================================ */
 #define MIC_I2S_PORT           I2S_NUM_0
-#define MIC_I2S_GPIO_WS        GPIO_NUM_7
-#define MIC_I2S_GPIO_SCK       GPIO_NUM_6
-#define MIC_I2S_GPIO_DATA_IN   GPIO_NUM_5
+#define MIC_I2S_GPIO_WS        ((gpio_num_t)I2S_WS_PIN)
+#define MIC_I2S_GPIO_SCK       ((gpio_num_t)I2S_SCK_PIN)
+#define MIC_I2S_GPIO_DATA_IN   ((gpio_num_t)I2S_SD_PIN)
 
 /* ============================================================
  *  Loa MAX98357A (I2S TX – theo AI XiaoZhi)
- *
- *  Đấu dây (module): DIN, BCLK, LRC
- *  ĐÃ CHUYỂN SANG ESP32-S3 30-PIN:
- *     DIN  -> GPIO4
- *     BCLK -> GPIO15
- *     LRC  -> GPIO16
+ *  DIN=GPIO16, BCLK=GPIO7, LRC=GPIO15
  * ============================================================ */
 #define SPK_I2S_PORT           I2S_NUM_0
-#define SPK_I2S_GPIO_DATA_OUT  GPIO_NUM_4
-#define SPK_I2S_GPIO_BCLK      GPIO_NUM_15
-#define SPK_I2S_GPIO_LRCLK     GPIO_NUM_16
+#define SPK_I2S_GPIO_DATA_OUT  ((gpio_num_t)I2S_SD_OUT_PIN)
+#define SPK_I2S_GPIO_BCLK      ((gpio_num_t)SPK_I2S_BCLK_PIN)
+#define SPK_I2S_GPIO_LRCLK     ((gpio_num_t)SPK_I2S_LRCK_PIN)
 
 /* ============================================================
- *  GPS NEO-6M (UART1) – S3 30-pin
+ *  GPS NEO-6M (UART1)
  * ============================================================ */
 #define GPS_UART_NUM           UART_NUM_1
-#define GPS_RX_PIN             GPIO_NUM_18
-#define GPS_TX_PIN             GPIO_NUM_17
-#define GPS_BAUDRATE           9600
+#define GPS_RX_GPIO            ((gpio_num_t)GPS_RX_PIN)   // từ Config.h
+#define GPS_TX_GPIO            ((gpio_num_t)GPS_TX_PIN)
+#define GPS_BAUDRATE           GPS_BAUD
 
 /* ============================================================
  *  LED / Nút
  * ============================================================ */
-#define LED_WIFI_GPIO          GPIO_NUM_2
-#define LED_CRY_RED_GPIO       GPIO_NUM_3
-#define LED_CRY_GREEN_GPIO     GPIO_NUM_8
-#define MODE_BUTTON_GPIO       GPIO_NUM_9
+#define LED_WIFI_GPIO          ((gpio_num_t)LED_WIFI_PIN)
+#define LED_CRY_RED_GPIO       ((gpio_num_t)LED_CRY_RED_PIN)
+#define LED_CRY_GREEN_GPIO     LED_WIFI_GPIO
+#define MODE_BUTTON_GPIO       ((gpio_num_t)MODE_BUTTON_PIN)
+#define LED_NIGHT_GPIO         ((gpio_num_t)LED_NIGHT_PIN)
 
 /* ============================================================
  *  I2C BUS (tùy chọn)
  * ============================================================ */
-#ifndef I2C_SDA_PIN
-#define I2C_SDA_PIN            GPIO_NUM_21
-#endif
-#ifndef I2C_SCL_PIN
-#define I2C_SCL_PIN            GPIO_NUM_22
-#endif
+#define I2C_SDA_GPIO           ((gpio_num_t)I2C_SDA_PIN)
+#define I2C_SCL_GPIO           ((gpio_num_t)I2C_SCL_PIN)
 #define I2C_FREQ_HZ            400000
 
 #endif // _BOARD_CONFIG_H_
