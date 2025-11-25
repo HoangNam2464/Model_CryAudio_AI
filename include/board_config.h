@@ -6,7 +6,7 @@
 #include "Config.h"
 
 /* ============================================================
- *  ĐÃ CHUYỂN SANG ESP32-S3 30-PIN
+ *  ĐÃ CHUYỂN SANG ESP32-S3 30-PIN (mapping mới)
  * ============================================================ */
 #define USE_INMP441_MIC        1   // Mic INMP441 I2S RX
 #define USE_MAX98357A_SPK      1   // Amp MAX98357A I2S TX
@@ -27,7 +27,7 @@
 #endif
 
 /* ============================================================
- *  INMP441 (I2S RX – theo AI XiaoZhi)
+ *  INMP441 (I2S RX) - ESP32-S3
  *  WS=GPIO4, BCLK=GPIO5, DATA=GPIO6
  * ============================================================ */
 #define MIC_I2S_PORT           I2S_NUM_0
@@ -36,7 +36,7 @@
 #define MIC_I2S_GPIO_DATA_IN   ((gpio_num_t)I2S_SD_PIN)
 
 /* ============================================================
- *  Loa MAX98357A (I2S TX – theo AI XiaoZhi)
+ *  Loa MAX98357A (I2S TX) - ESP32-S3
  *  DIN=GPIO16, BCLK=GPIO7, LRC=GPIO15
  * ============================================================ */
 #define SPK_I2S_PORT           I2S_NUM_0

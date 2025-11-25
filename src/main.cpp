@@ -1,7 +1,3 @@
-// ESP32 DevKit / ESP32-S3
-// Wi-Fi + GPS ổn định, kèm AudioCry (mic/I2S + TFLM + speaker + API) tùy chọn.
-// Lưu ý: AudioCry cần nhiều RAM, khuyến nghị ESP32-S3/WROVER có PSRAM. DevKit không PSRAM có thể thiếu heap khi bật AI.
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <vector>
@@ -10,16 +6,27 @@
 #include <driver/i2s.h>
 #include <esp_task_wdt.h>
 #include <esp_heap_caps.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include <HardwareSerial.h>
+#include <cstdarg>
+#include <cstdio>
+#include <WebServer.h>
+#include <esp32-hal-psram.h>
+
+// Định nghĩa cổng log Serial0 (UART0)
+HardwareSerial Serial0(0);
 
 #include "Config.h"
 #include "board_config.h"
+#include "WifiConfig.h"
 #include <CryDetector.h>
 #include <RestClient.h>
 #include <tflm_infer.h>
 
 // ====== Cờ bật/tắt AudioCry ======
 // Để test Wi-Fi + GPS trên DevKit không PSRAM, tắt AudioCry nếu thiếu RAM.
-static constexpr bool ENABLE_AUDIOCRY = false;
+static constexpr bool ENABLE_AUDIOCRY = true;
 // Bật âm báo loa khi đổi night mode dù không chạy AI/mic (dùng I2S TX đơn giản)
 static constexpr bool ENABLE_SPEAKER_FEEDBACK = true;
 
@@ -70,6 +77,11 @@ static SemaphoreHandle_t gGpsMutex;
 // ====== Wi-Fi state ======
 static bool g_wifiConnected = false;
 static uint32_t g_lastWifiLostMs = 0;
+static bool g_apActive = false;
+static bool g_wifiReconnectRequested = false;
+static WifiCredentials g_wifiCreds;
+static WebServer g_webServer(80);
+static bool g_psramOk = false;
 
 // ====== Cry event ======
 struct CryEvent
@@ -91,6 +103,40 @@ static constexpr size_t TARGET_SAMPLES = static_cast<size_t>(I2S_SAMPLE_RATE * I
 static int16_t *g_inferWindow = nullptr;
 static uint32_t g_pcmBuffersAllocated = 0;
 static bool nightMode = false;
+static float g_lastProb = 0.0f;
+static float g_lastScore = 0.0f;
+static bool g_isCrying = false;
+static char g_lastEvent[16] = "boot";
+static uint32_t g_lastEventTs = 0;
+static double g_lastLat = 0;
+static double g_lastLng = 0;
+static bool g_gpsValid = false;
+static char g_statusMessage[64] = "Booting";
+// ==== Speaker helpers ====
+static void playBeep(int freq, int durationMs, int volume);
+static void playVoice(const char *filename);
+
+// ==== Logging on Serial0 ====
+void log0(const String &msg)
+{
+    Serial0.println(msg);
+}
+void logf(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    Serial0.println(buf);
+}
+void setStatusMessage(const char *msg)
+{
+    if (!msg)
+        return;
+    strncpy(g_statusMessage, msg, sizeof(g_statusMessage) - 1);
+    g_statusMessage[sizeof(g_statusMessage) - 1] = '\0';
+}
 static void updateWifiLed(bool connected)
 {
     pinMode(LED_WIFI_PIN, OUTPUT);
@@ -135,18 +181,15 @@ static constexpr DetectorProfile DAY_PROFILE{
 static constexpr DetectorProfile NIGHT_PROFILE{
     0.78f, 0.22f, 1.5f, 2.8f, 2.5f, 2.0f};
 
-// Speaker command
-enum class SpeakCmd : uint8_t
+// Speaker event
+enum class SpeakerEvent : uint8_t
 {
-    Cry,
-    Calm,
-    NightOn,
-    NightOff,
-    Ting,
-    NightModeOnVoice,
-    NightModeOffVoice,
-    CryDayVoice,
-    CalmDayVoice
+    EVENT_MODE_DAY,
+    EVENT_MODE_NIGHT,
+    EVENT_CRY_DAY,   // Voice: "Em bé đang khóc"
+    EVENT_CALM_DAY,  // Voice: "Em bé ngủ yên"
+    EVENT_CRY_NIGHT, // Beep nhỏ
+    EVENT_CALM_NIGHT // Beep rất nhẹ
 };
 
 // Forward declarations
@@ -154,6 +197,8 @@ void setupWiFi();
 void setupGPS();
 void setupAudioCry();
 void setupSpeakerFeedback();
+void setupWebServer();
+void checkPsram();
 void taskWifi(void *param);
 void taskGps(void *param);
 void taskApp(void *param);
@@ -161,10 +206,18 @@ void taskMic(void *param);
 void taskInfer(void *param);
 void taskSpeaker(void *param);
 void taskSender(void *param);
+void taskWeb(void *param);
 bool parseNMEA(const char *line, size_t len, GpsData &out);
 void startSetupAP();
 void stopSetupAP();
 void applyDetectorProfile();
+
+// ==== CryDetector profile ====
+void applyDetectorProfile()
+{
+    const DetectorProfile &p = nightMode ? NIGHT_PROFILE : DAY_PROFILE;
+    detector.configure(p.onTh, p.offTh, p.stableOn, p.stableOff, p.minOn, p.minOff);
+}
 
 // ==== Wi-Fi event callback ====
 void handleWiFiEvent(WiFiEvent_t event)
@@ -172,20 +225,23 @@ void handleWiFiEvent(WiFiEvent_t event)
     switch (event)
     {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-        Serial.println("[WiFi] Connected to AP");
+        log0("[WiFi] Connected to AP");
         updateWifiLed(true);
+        setStatusMessage("WiFi ket noi, cho IP...");
         break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
         g_wifiConnected = true;
         stopSetupAP();
-        Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
+        logf("[WiFi] IP: %s", WiFi.localIP().toString().c_str());
         updateWifiLed(true);
+        setStatusMessage("WiFi da ket noi");
         break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
         g_wifiConnected = false;
         g_lastWifiLostMs = millis();
-        Serial.println("[WiFi] Lost");
+        log0("[WiFi] Lost");
         updateWifiLed(false);
+        setStatusMessage("Mat WiFi, se fallback AP neu can.");
         break;
     default:
         break;
@@ -195,22 +251,42 @@ void handleWiFiEvent(WiFiEvent_t event)
 // ==== Setup Wi-Fi ====
 void setupWiFi()
 {
+    wifi_config_init();
+    wifi_config_load(g_wifiCreds);
     WiFi.mode(WIFI_STA);
     WiFi.onEvent(handleWiFiEvent);
     WiFi.persistent(false);
     WiFi.setAutoReconnect(false);
+    WiFi.setSleep(false);
     g_lastWifiLostMs = millis();
+    if (g_wifiCreds.ssid.isEmpty())
+    {
+        log0("[WiFi] No Wi-Fi credentials saved, enabling setup AP");
+        setStatusMessage("Chua co WiFi, dung AP cau hinh.");
+        startSetupAP();
+    }
 }
 
 // ==== AP fallback ====
 void startSetupAP()
 {
+    if (g_apActive)
+        return;
     if (WiFi.getMode() != WIFI_AP && WiFi.getMode() != WIFI_AP_STA)
     {
         WiFi.mode(WIFI_AP_STA);
     }
-    WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASS);
-    Serial.printf("[WiFi] AP fallback: %s / %s\n", SETUP_AP_SSID, SETUP_AP_PASS);
+    if (WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASS))
+    {
+        g_apActive = true;
+        IPAddress ip = WiFi.softAPIP();
+        logf("[WiFi] AP fallback: %s / %s (IP %s)", SETUP_AP_SSID, SETUP_AP_PASS, ip.toString().c_str());
+        setStatusMessage("Dang mo AP cau hinh WiFi.");
+    }
+    else
+    {
+        log0("[WiFi] Failed to start AP fallback");
+    }
 }
 
 void stopSetupAP()
@@ -220,27 +296,205 @@ void stopSetupAP()
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_STA);
     }
+    g_apActive = false;
+}
+
+// ==== PSRAM check ====
+void checkPsram()
+{
+    g_psramOk = psramInit() && psramFound();
+    if (g_psramOk)
+    {
+        size_t psSize = ESP.getPsramSize();
+        size_t psFree = ESP.getFreePsram();
+        logf("[PSRAM] OK size=%u free=%u", (unsigned)psSize, (unsigned)psFree);
+    }
+    else
+    {
+        log0("[PSRAM] Not detected. AI may fail; please use S3 with PSRAM or reduce model.");
+        setStatusMessage("PSRAM khong thay, AI co the tat.");
+    }
+}
+
+// ==== Web server (status + Wi-Fi config) ====
+static String htmlEscape(const String &in)
+{
+    String out;
+    out.reserve(in.length());
+    for (size_t i = 0; i < in.length(); ++i)
+    {
+        char c = in[i];
+        switch (c)
+        {
+        case '&':
+            out += F("&amp;");
+            break;
+        case '<':
+            out += F("&lt;");
+            break;
+        case '>':
+            out += F("&gt;");
+            break;
+        case '"':
+            out += F("&quot;");
+            break;
+        case '\'':
+            out += F("&#39;");
+            break;
+        default:
+            out += c;
+            break;
+        }
+    }
+    return out;
+}
+
+static void handleRoot()
+{
+    g_webServer.send(200, "text/plain", "AudioCry ESP32 - OK");
+}
+
+static void handleStatusJson()
+{
+    String json = "{";
+    json += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+    json += "\"ip_sta\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"ip_ap\":\"" + WiFi.softAPIP().toString() + "\",";
+    json += "\"prob\":" + String(g_lastProb, 3) + ",";
+    json += "\"score\":" + String(g_lastScore, 3) + ",";
+    json += "\"crying\":";
+    json += (g_isCrying ? "true" : "false");
+    json += ",";
+    json += "\"lat\":" + String(g_lastLat, 6) + ",";
+    json += "\"lng\":" + String(g_lastLng, 6) + ",";
+    json += "\"gps_valid\":";
+    json += (g_gpsValid ? "true" : "false");
+    json += ",";
+    json += "\"status\":\"" + String(g_statusMessage) + "\",";
+    json += "\"night_mode\":";
+    json += (nightMode ? "true" : "false");
+    json += ",";
+    json += "\"last_event\":\"" + String(g_lastEvent) + "\",";
+    json += "\"last_event_ts\":";
+    json += String(g_lastEventTs);
+    json += "}";
+    g_webServer.send(200, "application/json", json);
+}
+
+static void handleWifiConfig()
+{
+    WifiCredentials creds;
+    wifi_config_load(creds);
+    WifiCredentials updated = creds;
+    String message;
+    if (g_webServer.method() == HTTP_POST)
+    {
+        String action = g_webServer.arg("action");
+        if (action == "delete")
+        {
+            wifi_config_clear();
+            creds = WifiCredentials{};
+            updated = creds;
+            g_wifiCreds = updated;
+            g_wifiReconnectRequested = true;
+            g_lastWifiLostMs = millis();
+            startSetupAP();
+            setStatusMessage("Chua co WiFi, dung AP cau hinh.");
+            message = F("Da xoa WiFi da luu.");
+        }
+        else
+        {
+            updated.ssid = g_webServer.arg("ssid");
+            updated.pass = g_webServer.arg("pass");
+            updated.ssid.trim();
+            wifi_config_save(updated);
+            g_wifiCreds = updated;
+            g_wifiReconnectRequested = true;
+            g_lastWifiLostMs = millis();
+            startSetupAP();
+            setStatusMessage("Da luu WiFi moi, dang ket noi...");
+            message = F("Da luu WiFi, doi vai giay de ket noi lai.");
+        }
+    }
+    String html = F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>AudioCry WiFi</title><style>body{font-family:sans-serif;margin:2rem;}form{max-width:420px;padding:1rem;border:1px solid #ccc;border-radius:8px;}label{display:block;margin-top:0.8rem;font-weight:600;}input{width:100%;padding:0.4rem;margin-top:0.2rem;}button{margin-top:1rem;padding:0.6rem 1.2rem;} .msg{padding:0.6rem;background:#eef;border:1px solid #77f;border-radius:6px;margin-bottom:1rem;}</style></head><body>");
+    html += F("<h2>AudioCry ESP32 - Cau hinh WiFi</h2>");
+    if (message.length())
+    {
+        html += "<div class='msg'>" + message + "</div>";
+    }
+    html += "<p>Trang thai: <strong>" + htmlEscape(String(g_statusMessage)) + "</strong></p>";
+    if (g_wifiConnected)
+    {
+        html += "<p>Dang ket noi: <strong>" + htmlEscape(WiFi.SSID()) + "</strong> (IP " + WiFi.localIP().toString() + ")</p>";
+    }
+    else
+    {
+        html += F("<p>Chua ket noi WiFi.</p>");
+    }
+    if (g_apActive)
+    {
+        html += "<p>AP cau hinh: <strong>" + htmlEscape(String(SETUP_AP_SSID)) + "</strong> (pass " + String(SETUP_AP_PASS) + ", IP " + WiFi.softAPIP().toString() + ")</p>";
+    }
+    html += F("<section><h3>Saved Wi-Fi</h3>");
+    if (creds.ssid.length())
+    {
+        html += "<div><strong>" + htmlEscape(creds.ssid) + "</strong>";
+        html += F(" <form method='POST' style='display:inline;margin-left:0.5rem;'>");
+        html += F("<input type='hidden' name='action' value='delete'>");
+        html += F("<button type='submit'>Xoa</button></form></div>");
+    }
+    else
+    {
+        html += F("<p>Chua luu Wi-Fi nao.</p>");
+    }
+    html += F("</section>");
+    html += F("<form method='POST'>");
+    html += "<label>SSID</label><input name='ssid' maxlength='32' value='" + htmlEscape(updated.ssid) + "' placeholder='Ten WiFi'>";
+    html += "<label>Mat khau</label><input type='password' name='pass' maxlength='63' value='" + htmlEscape(updated.pass) + "' placeholder='Mat khau'>";
+    html += F("<button type='submit'>Luu</button></form>");
+    html += F("</body></html>");
+    g_webServer.send(200, "text/html", html);
+}
+
+void setupWebServer()
+{
+    g_webServer.on("/", handleRoot);
+    g_webServer.on("/status", handleStatusJson);
+    g_webServer.on("/wifi", HTTP_GET, handleWifiConfig);
+    g_webServer.on("/wifi", HTTP_POST, handleWifiConfig);
+    g_webServer.begin();
+    log0("[Web] HTTP server started on :80");
+}
+
+void taskWeb(void *param)
+{
+    for (;;)
+    {
+        g_webServer.handleClient();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 // ==== Setup GPS ====
 void setupGPS()
 {
     Serial2.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    Serial.println("[GPS] Serial2 started");
+    log0("[GPS] Serial2 started");
 }
 
 // ==== Setup AudioCry (I2S) ====
 void setupAudioCry()
 {
-    bool needSpeaker = ENABLE_AUDIOCRY || ENABLE_SPEAKER_FEEDBACK;
-    if (!needSpeaker && !ENABLE_AUDIOCRY)
+    bool needMic = ENABLE_AUDIOCRY;
+    bool needSpeaker = ENABLE_AUDIOCRY || ENABLE_SPEAKER_FEEDBACK || USE_MAX98357A_SPK;
+    if (!needMic && !needSpeaker)
         return;
 
     i2s_config_t cfg = {};
     cfg.mode = I2S_MODE_MASTER;
-    if (ENABLE_AUDIOCRY)
-        cfg.mode = (i2s_mode_t)(cfg.mode | I2S_MODE_RX | I2S_MODE_TX);
-    else if (needSpeaker)
+    if (needMic)
+        cfg.mode = (i2s_mode_t)(cfg.mode | I2S_MODE_RX);
+    if (needSpeaker)
         cfg.mode = (i2s_mode_t)(cfg.mode | I2S_MODE_TX);
     cfg.sample_rate = I2S_SAMPLE_RATE;
     cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
@@ -250,20 +504,19 @@ void setupAudioCry()
     cfg.dma_buf_count = 8;
     cfg.dma_buf_len = I2S_READ_LEN;
     cfg.use_apll = false;
-    cfg.tx_desc_auto_clear = false;
+    cfg.tx_desc_auto_clear = needSpeaker;
     cfg.fixed_mclk = 0;
 
     i2s_pin_config_t pins = {};
     pins.bck_io_num = MIC_SCK;
     pins.ws_io_num = MIC_WS;
-    pins.data_out_num = SPK_DIN;
-    pins.data_in_num = ENABLE_AUDIOCRY ? MIC_SD : -1;
+    pins.data_out_num = needSpeaker ? SPK_DIN : I2S_PIN_NO_CHANGE;
+    pins.data_in_num = needMic ? MIC_SD : I2S_PIN_NO_CHANGE;
 
-    i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
-    i2s_set_pin(I2S_NUM_0, &pins);
-    i2s_set_clk(I2S_NUM_0, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    i2s_driver_install(MIC_I2S_PORT, &cfg, 0, nullptr);
+    i2s_set_pin(MIC_I2S_PORT, &pins);
+    i2s_set_clk(MIC_I2S_PORT, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
 
-    // alloc infer window (chỉ khi chạy AI)
     if (ENABLE_AUDIOCRY)
     {
         g_inferWindow = (int16_t *)heap_caps_malloc(TARGET_SAMPLES * sizeof(int16_t),
@@ -275,32 +528,43 @@ void setupAudioCry()
         }
     }
 }
-
-// ==== CryDetector profile ====
-void applyDetectorProfile()
-{
-    const DetectorProfile &p = nightMode ? NIGHT_PROFILE : DAY_PROFILE;
-    detector.configure(p.onTh, p.offTh, p.stableOn, p.stableOff, p.minOn, p.minOff);
-}
-
 // ==== Task Wi-Fi ====
 void taskWifi(void *param)
 {
     uint32_t backoff = WIFI_BACKOFF_MIN_MS;
-    Serial.println("[WiFiTask] start");
+    log0("[WiFiTask] start");
     for (;;)
     {
+        uint32_t now = millis();
+        if (g_wifiReconnectRequested)
+        {
+            g_wifiReconnectRequested = false;
+            WiFi.disconnect(true, true);
+            g_wifiConnected = false;
+            g_lastWifiLostMs = now;
+            backoff = WIFI_BACKOFF_MIN_MS;
+        }
         if (!g_wifiConnected)
         {
-            // Tạm tắt AP fallback để tránh xung đột mode; chỉ thử STA trước
-            if (WiFi.getMode() == WIFI_AP)
+            if (g_wifiCreds.ssid.isEmpty())
             {
-                WiFi.softAPdisconnect(true);
-                WiFi.mode(WIFI_STA);
+                if (!g_apActive)
+                {
+                    startSetupAP();
+                }
+                setStatusMessage("Chua co WiFi, dung AP cau hinh.");
+                vTaskDelay(pdMS_TO_TICKS(400));
+                continue;
             }
 
-            Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
-            WiFi.begin(WIFI_SSID, WIFI_PASS);
+            if (WiFi.getMode() == WIFI_AP)
+            {
+                WiFi.mode(WIFI_AP_STA);
+            }
+
+            logf("[WiFi] Connecting to %s...", g_wifiCreds.ssid.c_str());
+            setStatusMessage("Dang ket noi WiFi...");
+            WiFi.begin(g_wifiCreds.ssid.c_str(), g_wifiCreds.pass.c_str());
 
             uint32_t t0 = millis();
             while (!g_wifiConnected && (millis() - t0) < backoff)
@@ -309,30 +573,38 @@ void taskWifi(void *param)
             }
             if (g_wifiConnected)
             {
-                Serial.println("[WiFi] Connected");
+                log0("[WiFi] Connected");
                 backoff = WIFI_BACKOFF_MIN_MS;
             }
             else
             {
-                Serial.printf("[WiFi] Retry in %u ms\n", backoff);
+                logf("[WiFi] Retry in %u ms", backoff);
+                if (!g_apActive || (millis() - g_lastWifiLostMs) > WIFI_AP_FALLBACK_MS)
+                {
+                    startSetupAP();
+                }
+                g_lastWifiLostMs = millis();
                 backoff = std::min(backoff * 2, WIFI_BACKOFF_MAX_MS);
             }
         }
+        now = millis();
+        if (!g_wifiConnected && (now - g_lastWifiLostMs) > WIFI_AP_FALLBACK_MS)
+        {
+            startSetupAP();
+        }
         static uint32_t lastLog = 0;
-        uint32_t now = millis();
         if (g_wifiConnected && now - lastLog > 5000)
         {
-            Serial.println("[WiFi] Link healthy");
+            log0("[WiFi] Link healthy");
             lastLog = now;
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
-
 // ==== Task GPS ====
 void taskGps(void *param)
 {
-    Serial.println("[GPS] task started");
+    log0("[GPS] task started");
     char lineBuf[160];
     size_t idx = 0;
     uint32_t lastRx = millis();
@@ -364,7 +636,7 @@ void taskGps(void *param)
                             // nếu liên tục sats=0 quá 30s sẽ log cảnh báo
                             if (millis() - lastSatsZeroMs > 30000)
                             {
-                                Serial.println("[GPS] Sats=0 >30s, kiểm tra anten/vị trí");
+                                log0("[GPS] Sats=0 >30s, kiểm tra anten/vị trí");
                                 lastSatsZeroMs = millis();
                             }
                         }
@@ -384,12 +656,12 @@ void taskGps(void *param)
         }
         if (millis() - lastRx > 5000)
         {
-            Serial.println("[GPS] No data >5s");
+            log0("[GPS] No data >5s");
             lastRx = millis();
         }
         if (millis() - lastAnyNmeaMs > 30000)
         {
-            Serial.println("[GPS] Dữ liệu bất thường, không thấy GGA/RMC >30s. Kiểm tra anten/chân RX/TX.");
+            log0("[GPS] Dữ liệu bất thường, không thấy GGA/RMC >30s. Kiểm tra anten/chân RX/TX.");
             lastAnyNmeaMs = millis();
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -417,9 +689,12 @@ void taskApp(void *param)
                 snapshot = g_gps;
                 xSemaphoreGive(gGpsMutex);
             }
-            Serial.printf("[GPS] Lat: %.6f, Lon: %.6f, Speed: %.2f, Sat: %u, Fix: %s\n",
-                          snapshot.lat, snapshot.lon, snapshot.speed,
-                          snapshot.sats, snapshot.fix ? "OK" : "NO");
+            g_lastLat = snapshot.lat;
+            g_lastLng = snapshot.lon;
+            g_gpsValid = snapshot.fix;
+            logf("[GPS] Lat: %.6f, Lon: %.6f, Speed: %.2f, Sat: %u, Fix: %s",
+                 snapshot.lat, snapshot.lon, snapshot.speed,
+                 snapshot.sats, snapshot.fix ? "OK" : "NO");
             lastLog = now;
         }
         // toggle night mode
@@ -430,21 +705,10 @@ void taskApp(void *param)
             lastChange = nowMs;
             nightMode = !nightMode;
             applyDetectorProfile();
-            if (ENABLE_AUDIOCRY)
+            if (qSpeaker)
             {
-                SpeakCmd cmd = nightMode ? SpeakCmd::NightOn : SpeakCmd::NightOff;
-                if (qSpeaker)
-                    xQueueSend(qSpeaker, &cmd, 0);
-            }
-            else if (ENABLE_SPEAKER_FEEDBACK)
-            {
-#if USE_MAX98357A_SPK
-                if (qSpeaker)
-                {
-                    SpeakCmd cmd = nightMode ? SpeakCmd::NightModeOnVoice : SpeakCmd::NightModeOffVoice;
-                    xQueueSend(qSpeaker, &cmd, 0);
-                }
-#endif
+                SpeakerEvent ev = nightMode ? SpeakerEvent::EVENT_MODE_NIGHT : SpeakerEvent::EVENT_MODE_DAY;
+                xQueueSend(qSpeaker, &ev, 0);
             }
             updateNightLed();
             // Nhay LED Wi-Fi (LED xanh duong tren board) de bao doi che do
@@ -453,7 +717,7 @@ void taskApp(void *param)
             digitalWrite(LED_WIFI_PIN, LOW);
             // Khoi phuc trang thai LED Wi-Fi theo ket noi hien tai
             updateWifiLed(g_wifiConnected);
-            Serial.printf("[MODE] nightMode=%s\n", nightMode ? "ON" : "OFF");
+            logf("[MODE] nightMode=%s", nightMode ? "ON" : "OFF");
         }
         lastBtn = btn;
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -470,7 +734,7 @@ static bool initPcmPool()
     for (uint32_t i = 0; i < PCM_POOL_BUFFERS; ++i)
     {
         int16_t *buf = (int16_t *)heap_caps_malloc(I2S_READ_LEN * sizeof(int16_t),
-                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!buf)
         {
             buf = (int16_t *)heap_caps_malloc(I2S_READ_LEN * sizeof(int16_t),
@@ -520,7 +784,7 @@ void taskMic(void *param)
             continue;
         }
         // Không để i2s_read block quá lâu để tránh WDT
-        esp_err_t err = i2s_read(I2S_NUM_0,
+        esp_err_t err = i2s_read(MIC_I2S_PORT,
                                  block,
                                  I2S_READ_LEN * sizeof(int16_t),
                                  &bytes_read,
@@ -541,14 +805,23 @@ void taskMic(void *param)
 }
 
 // ==== Task Speaker ====
-static void speaker_write(const int16_t *data, size_t samples)
+static void playBeep(int freq, int durationMs, int volume)
 {
-    const uint8_t *ptr = reinterpret_cast<const uint8_t *>(data);
-    size_t bytesRemaining = samples * sizeof(int16_t);
+    const size_t N = static_cast<size_t>(I2S_SAMPLE_RATE * (durationMs / 1000.0f));
+    static std::vector<int16_t> buf;
+    buf.resize(N);
+    for (size_t i = 0; i < N; ++i)
+    {
+        float env = sinf(3.14159f * i / N);
+        float s = sinf(2.0f * 3.14159f * freq * i / I2S_SAMPLE_RATE) * env;
+        buf[i] = static_cast<int16_t>(s * volume);
+    }
+    const uint8_t *ptr = reinterpret_cast<const uint8_t *>(buf.data());
+    size_t bytesRemaining = buf.size() * sizeof(int16_t);
     while (bytesRemaining > 0)
     {
         size_t written = 0;
-        i2s_write(I2S_NUM_0, ptr, bytesRemaining, &written, pdMS_TO_TICKS(200));
+        i2s_write(SPK_I2S_PORT, ptr, bytesRemaining, &written, pdMS_TO_TICKS(200));
         if (written == 0)
             break;
         ptr += written;
@@ -556,65 +829,78 @@ static void speaker_write(const int16_t *data, size_t samples)
     }
 }
 
-static void speaker_play_cmd(SpeakCmd cmd)
+static void playVoice(const char *filename)
 {
-    // Placeholder bằng các pattern beep khác nhau cho từng thông báo
-    auto play_beep = [](float freq, float ms, float volume = 12000.0f) {
-        const size_t N = static_cast<size_t>(I2S_SAMPLE_RATE * (ms / 1000.0f));
-        static std::vector<int16_t> buf;
-        buf.resize(N);
-        for (size_t i = 0; i < N; ++i)
-        {
-            float env = sinf(3.14159f * i / N);
-            float s = sinf(2.0f * 3.14159f * freq * i / I2S_SAMPLE_RATE) * env;
-            buf[i] = static_cast<int16_t>(s * volume);
-        }
-        speaker_write(buf.data(), N);
-    };
-
-    switch (cmd)
+    if (!SPIFFS.begin(true))
     {
-    case SpeakCmd::NightOn:
-    case SpeakCmd::NightModeOnVoice:
-        // "Đã bật chế độ ban đêm" -> 2 beep ngắn
-        play_beep(600.0f, 150);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        play_beep(700.0f, 200);
-        break;
-    case SpeakCmd::NightOff:
-    case SpeakCmd::NightModeOffVoice:
-        // "Đã bật chế độ ban ngày" -> 1 beep dài
-        play_beep(800.0f, 300);
-        break;
-    case SpeakCmd::Cry:
-        // Day: "Em bé đang khóc – hãy kiểm tra" -> 3 beep nhanh
-        play_beep(550.0f, 180);
-        vTaskDelay(pdMS_TO_TICKS(60));
-        play_beep(550.0f, 180);
-        vTaskDelay(pdMS_TO_TICKS(60));
-        play_beep(650.0f, 220);
-        break;
-    case SpeakCmd::Calm:
-        // Day: "Bé đã yên" -> beep mềm
-        play_beep(450.0f, 200, 9000.0f);
-        break;
-    case SpeakCmd::Ting:
-        // Night: ting ngắn
-        play_beep(900.0f, 120);
-        break;
-    default:
-        break;
+        log0("[SPK] SPIFFS mount failed");
+        return;
     }
+    File f = SPIFFS.open(filename, "r");
+    if (!f)
+    {
+        logf("[SPK] Voice file missing: %s", filename);
+        return;
+    }
+    uint8_t header[44];
+    if (f.read(header, sizeof(header)) != sizeof(header))
+    {
+        log0("[SPK] WAV header read fail");
+        f.close();
+        return;
+    }
+    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0)
+    {
+        log0("[SPK] Not a WAV file");
+        f.close();
+        return;
+    }
+    const size_t chunk = 1024;
+    static std::vector<uint8_t> wavBuf;
+    wavBuf.resize(chunk);
+    while (true)
+    {
+        size_t r = f.read(wavBuf.data(), chunk);
+        if (r == 0)
+            break;
+        size_t written = 0;
+        i2s_write(SPK_I2S_PORT, wavBuf.data(), r, &written, pdMS_TO_TICKS(200));
+        if (written == 0)
+            break;
+    }
+    f.close();
 }
 
 void taskSpeaker(void *param)
 {
-    SpeakCmd cmd = SpeakCmd::Calm;
+    SpeakerEvent ev = SpeakerEvent::EVENT_CALM_DAY;
     for (;;)
     {
-        if (xQueueReceive(qSpeaker, &cmd, portMAX_DELAY) == pdTRUE)
+        if (xQueueReceive(qSpeaker, &ev, portMAX_DELAY) == pdTRUE)
         {
-            speaker_play_cmd(cmd);
+            switch (ev)
+            {
+            case SpeakerEvent::EVENT_MODE_DAY:
+                playBeep(1000, 80, 4000);
+                break;
+            case SpeakerEvent::EVENT_MODE_NIGHT:
+                playBeep(800, 80, 3000);
+                break;
+            case SpeakerEvent::EVENT_CRY_DAY:
+                playVoice("/cry_day.wav");
+                break;
+            case SpeakerEvent::EVENT_CALM_DAY:
+                playVoice("/calm_day.wav");
+                break;
+            case SpeakerEvent::EVENT_CRY_NIGHT:
+                playBeep(700, 120, 2500);
+                break;
+            case SpeakerEvent::EVENT_CALM_NIGHT:
+                playBeep(600, 80, 1800);
+                break;
+            default:
+                break;
+            }
         }
     }
 }
@@ -624,7 +910,7 @@ void taskInfer(void *param)
 {
     if (!g_inferWindow)
     {
-        Serial.println("[AI] No infer buffer");
+        log0("[AI] No infer buffer");
         vTaskDelete(nullptr);
     }
     int retry = 0;
@@ -632,10 +918,10 @@ void taskInfer(void *param)
     while (!tflm_begin())
     {
         retry++;
-        Serial.println("[AI] Failed to init TFLM, retrying...");
+        log0("[AI] Failed to init TFLM, retrying...");
         if (retry >= kMaxRetry)
         {
-            Serial.println("[AI] Disable AI (init failed / low RAM). Dùng S3 PSRAM hoặc giảm arena.");
+            log0("[AI] Disable AI (init failed / low RAM). Dùng S3 PSRAM hoặc giảm arena.");
             vTaskDelete(nullptr);
         }
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -663,13 +949,20 @@ void taskInfer(void *param)
         float prob = tflm_infer_prob(g_inferWindow, TARGET_SAMPLES);
         bool state = detector.update(prob);
         float score = detector.score();
+        g_lastProb = prob;
+        g_lastScore = score;
+        g_isCrying = state;
         if (state != prevState)
         {
             updateCryLed(state);
-            if (ENABLE_AUDIOCRY && qSpeaker)
+            if (qSpeaker)
             {
-                SpeakCmd cmd = nightMode ? SpeakCmd::Ting : (state ? SpeakCmd::Cry : SpeakCmd::Calm);
-                xQueueSend(qSpeaker, &cmd, 0);
+                SpeakerEvent ev;
+                if (nightMode)
+                    ev = state ? SpeakerEvent::EVENT_CRY_NIGHT : SpeakerEvent::EVENT_CALM_NIGHT;
+                else
+                    ev = state ? SpeakerEvent::EVENT_CRY_DAY : SpeakerEvent::EVENT_CALM_DAY;
+                xQueueSend(qSpeaker, &ev, 0);
             }
             CryEvent evt{};
             evt.crying = state;
@@ -677,16 +970,32 @@ void taskInfer(void *param)
             evt.prob = prob;
             evt.score = score;
             evt.tsMs = millis();
+            GpsData snapshot{};
+            if (xSemaphoreTake(gGpsMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+            {
+                snapshot = g_gps;
+                xSemaphoreGive(gGpsMutex);
+            }
+            evt.lat = snapshot.lat;
+            evt.lon = snapshot.lon;
+            evt.gpsValid = snapshot.fix;
+            evt.durationMs = static_cast<uint32_t>(INFER_INTERVAL_S * 1000);
+            g_lastLat = snapshot.lat;
+            g_lastLng = snapshot.lon;
+            g_gpsValid = snapshot.fix;
+            strncpy(g_lastEvent, state ? "cry_on" : "cry_off", sizeof(g_lastEvent) - 1);
+            g_lastEvent[sizeof(g_lastEvent) - 1] = '\0';
+            g_lastEventTs = evt.tsMs;
             if (qEvents)
             {
                 if (xQueueSend(qEvents, &evt, pdMS_TO_TICKS(10)) != pdTRUE)
                 {
-                    Serial.println("[AI] Event queue full");
+                    log0("[AI] Event queue full");
                 }
             }
             prevState = state;
-            Serial.printf("[AI] State %s prob=%.3f score=%.3f night=%s\n",
-                          state ? "CRY" : "CALM", prob, score, nightMode ? "ON" : "OFF");
+            logf("[AI] State %s prob=%.3f score=%.3f night=%s",
+                 state ? "CRY" : "CALM", prob, score, nightMode ? "ON" : "OFF");
         }
         filled = 0;
         vTaskDelay(pdMS_TO_TICKS((uint32_t)(INFER_INTERVAL_S * 1000)));
@@ -765,7 +1074,8 @@ bool parseNMEA(const char *line, size_t len, GpsData &out)
     if (tok_count == 0 || !tokens[0])
         return false;
 
-    auto endsWith = [](const char *s, const char *suffix) {
+    auto endsWith = [](const char *s, const char *suffix)
+    {
         size_t ls = strlen(s), lsf = strlen(suffix);
         if (ls < lsf)
             return false;
@@ -799,48 +1109,48 @@ bool parseNMEA(const char *line, size_t len, GpsData &out)
 // ==== Arduino setup/loop ====
 void setup()
 {
-    Serial.begin(115200);
+    Serial0.begin(115200);
     delay(200);
+    log0("[BOOT] start app");
     gGpsMutex = xSemaphoreCreateMutex();
 
     setupWiFi();
     setupGPS();
-    setupAudioCry();
+    checkPsram();
+    setupAudioCry(); // Tạm comment để khoanh vùng reboot
+    setupWebServer();
     // Khởi tạo LED báo trạng thái (tắt sẵn)
     updateCryLed(false);
     pinMode(LED_NIGHT_PIN, OUTPUT);
     updateNightLed();
     updateWifiLed(false);
 
+    // Luôn tạo speaker queue/task nếu có loa
+#if USE_MAX98357A_SPK
+    if (!qSpeaker)
+    {
+        qSpeaker = xQueueCreate(4, sizeof(SpeakerEvent));
+        xTaskCreatePinnedToCore(taskSpeaker, "speaker", 4096, nullptr, 1, &hSpeaker, 1);
+    }
+#endif
+
     xTaskCreatePinnedToCore(taskWifi, "wifi", 4096, nullptr, 2, &hWifi, 0);
     xTaskCreatePinnedToCore(taskGps, "gps", 4096, nullptr, 3, &hGps, 1);
     xTaskCreatePinnedToCore(taskApp, "app", 4096, nullptr, 1, &hApp, 1);
+    xTaskCreatePinnedToCore(taskWeb, "web", 4096, nullptr, 1, nullptr, 1);
     if (ENABLE_AUDIOCRY)
     {
         if (initPcmPool())
         {
             qEvents = xQueueCreate(6, sizeof(CryEvent));
-#if USE_MAX98357A_SPK
-            qSpeaker = xQueueCreate(4, sizeof(SpeakCmd));
-#endif
             xTaskCreatePinnedToCore(taskMic, "mic", 3072, nullptr, 2, &hMic, 0);
             xTaskCreatePinnedToCore(taskInfer, "infer", 7168, nullptr, 1, &hInfer, 1);
             xTaskCreatePinnedToCore(taskSender, "sender", 3072, nullptr, 1, &hSender, 1);
-#if USE_MAX98357A_SPK
-            xTaskCreatePinnedToCore(taskSpeaker, "speaker", 4096, nullptr, 1, &hSpeaker, 1);
-#endif
         }
         else
         {
-            Serial.println("[Init] Failed to init PCM pool, AudioCry disabled");
+            log0("[Init] Failed to init PCM pool, AudioCry disabled");
         }
-    }
-    else if (ENABLE_SPEAKER_FEEDBACK)
-    {
-#if USE_MAX98357A_SPK
-        qSpeaker = xQueueCreate(2, sizeof(SpeakCmd));
-        xTaskCreatePinnedToCore(taskSpeaker, "speaker", 4096, nullptr, 1, &hSpeaker, 1);
-#endif
     }
 }
 
@@ -849,23 +1159,6 @@ void loop()
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
-/* ================= HƯỚNG DẪN =================
-1) Bật/tắt AudioCry:
-   - Đặt ENABLE_AUDIOCRY = false nếu chạy trên DevKit không PSRAM (tránh thiếu RAM).
-   - Đặt ENABLE_AUDIOCRY = true trên ESP32-S3/WROVER có PSRAM; bổ sung pipeline AI/loa nếu cần.
-
-2) Tối ưu RAM:
-   - Giảm PCM_POOL_BUFFERS nếu cần.
-   - Giảm stack các task mic/infer/sender nếu thấy heap thấp.
-   - Chuyển arena TFLM và buffer lên PSRAM (đã dùng heap_caps_malloc với MALLOC_CAP_SPIRAM).
-
-3) Khi nào cần chuyển sang ESP32-S3/WROVER:
-   - Khi bật AI TFLM, model lớn (>150 KB) sẽ cần PSRAM cho tensor arena và buffer mel.
-   - Khi chạy đồng thời Wi-Fi + GPS + AI + loa mà DevKit báo thiếu heap hoặc reset.
-
-4) Pin mẫu:
-   - GPS (DevKit): RX=16, TX=17
-   - GPS (S3): RX=43, TX=44
-   - I2S mic: SD=32, WS=25, SCK=26
-   - I2S loa: DIN=33, BCLK=14, LRCLK=27
-*/
+#include <Arduino.h>
+// UPDATE: Đã kiểm tra runtime theo dự án test (WiFi/HTTP, MIC/LOA/GPS, Flash)
+#include <WiFi.h>

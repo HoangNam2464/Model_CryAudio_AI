@@ -5,6 +5,9 @@
 #include <esp_log.h>
 #include <esp_task_wdt.h>
 #include <algorithm>
+#include <Arduino.h>
+#include <HardwareSerial.h>
+extern HardwareSerial Serial0;
 
 #ifndef LOG_LEVEL
 #define LOG_LEVEL 3
@@ -22,7 +25,7 @@ enum LogVerbosity
     do                                         \
     {                                          \
         if (LOG_LEVEL >= level)                \
-            Serial.printf(fmt, ##__VA_ARGS__); \
+            Serial0.printf(fmt, ##__VA_ARGS__); \
     } while (0)
 #define LOGE(fmt, ...) LOG_PRINT(LOG_ERROR_LEVEL, fmt, ##__VA_ARGS__)
 #define LOGW(fmt, ...) LOG_PRINT(LOG_WARN_LEVEL, fmt, ##__VA_ARGS__)
@@ -116,13 +119,13 @@ static void ensure_setup_ap()
     bool apOk = WiFi.softAP(g_setupApSsid.c_str(), CONFIG_AP_PASS, 6, 0, 4);
     if (apOk)
     {
-        Serial.printf("[WiFi] Setup AP enabled: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
+        Serial0.printf("[WiFi] Setup AP enabled: %s / %s\n", g_setupApSsid.c_str(), CONFIG_AP_PASS);
         g_setupApActive = true;
         log_setup_portal_link("Open setup portal");
     }
     else
     {
-        Serial.println("[WiFi] Failed to start setup AP");
+        Serial0.println("[WiFi] Failed to start setup AP");
     }
 }
 
@@ -380,7 +383,7 @@ void wifi_service_init()
         g_wifiEventGroup = xEventGroupCreate();
         if (!g_wifiEventGroup)
         {
-            Serial.println("[WiFi] Failed to create event group");
+            Serial0.println("[WiFi] Failed to create event group");
         }
     }
     wifi_config_init();
@@ -398,11 +401,11 @@ void wifi_service_start()
     BaseType_t ok = xTaskCreatePinnedToCore(taskWifi, "wifi", 4096, nullptr, 2, &g_wifiTask, 0);
     if (ok != pdPASS)
     {
-        Serial.printf("[WiFi] Failed to start wifi task on core0 (heap=%u)\n", (unsigned)esp_get_free_heap_size());
+        Serial0.printf("[WiFi] Failed to start wifi task on core0 (heap=%u)\n", (unsigned)esp_get_free_heap_size());
         ok = xTaskCreatePinnedToCore(taskWifi, "wifi", 4096, nullptr, 2, &g_wifiTask, 1);
         if (ok != pdPASS)
         {
-            Serial.printf("[WiFi] Failed to start wifi task on core1 (heap=%u)\n", (unsigned)esp_get_free_heap_size());
+            Serial0.printf("[WiFi] Failed to start wifi task on core1 (heap=%u)\n", (unsigned)esp_get_free_heap_size());
             g_wifiTask = nullptr;
         }
     }

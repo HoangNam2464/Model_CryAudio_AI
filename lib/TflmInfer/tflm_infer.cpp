@@ -1,4 +1,7 @@
 #include "tflm_infer.h"
+#include <Arduino.h>
+#include <HardwareSerial.h>
+extern HardwareSerial Serial0;
 
 #include <algorithm>
 #include <array>
@@ -134,13 +137,14 @@ bool tflm_begin() {
     const size_t mel_bytes = kFeatureCount * sizeof(float);
     const size_t safety_margin = 32 * 1024;  // 32 KB
     const size_t need_bytes = kTensorArenaSize + mel_bytes + safety_margin;
-    size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < need_bytes) {
-        Serial.printf("[AI] Not enough heap for TFLM (free=%u, need=%u). Disable AI or dùng PSRAM.\n",
-                      (unsigned)free_heap, (unsigned)need_bytes);
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t free_total = free_internal + free_psram;
+    if (free_total < need_bytes) {
+        Serial0.printf("[AI] Not enough heap for TFLM (int=%u, psram=%u, need=%u). Use S3 PSRAM or reduce arena.\n",
+                       (unsigned)free_internal, (unsigned)free_psram, (unsigned)need_bytes);
         return false;
     }
-
     if (!g_tensor_arena) {
         g_tensor_arena = static_cast<uint8_t*>(
             heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -149,7 +153,7 @@ bool tflm_begin() {
                 heap_caps_malloc(kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         }
         if (!g_tensor_arena) {
-            Serial.printf("[AI] Failed to alloc tensor arena (%u bytes, free=%u)\n",
+            Serial0.printf("[AI] Failed to alloc tensor arena (%u bytes, free=%u)\n",
                           (unsigned)kTensorArenaSize, (unsigned)esp_get_free_heap_size());
             return false;
         }
@@ -163,7 +167,7 @@ bool tflm_begin() {
                 heap_caps_malloc(kFeatureCount * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         }
         if (!g_mel_buffer) {
-            Serial.printf("[AI] Failed to alloc mel buffer (%u bytes, free=%u)\n",
+            Serial0.printf("[AI] Failed to alloc mel buffer (%u bytes, free=%u)\n",
                           (unsigned)(kFeatureCount * sizeof(float)), (unsigned)esp_get_free_heap_size());
             return false;
         }
@@ -177,7 +181,7 @@ bool tflm_begin() {
     }
 
     if (s_interpreter->AllocateTensors() != kTfLiteOk) {
-        Serial.println("[AI] AllocateTensors failed");
+        Serial0.println("[AI] AllocateTensors failed");
         return false;
     }
 
