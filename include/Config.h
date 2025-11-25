@@ -2,8 +2,8 @@
 #define CONFIG_H
 
 // Wi-Fi / Backend giữ nguyên logic cũ
-#define WIFI_SSID      "Xom Tro"
-#define WIFI_PASS      "12345679"
+#define WIFI_SSID      ""
+#define WIFI_PASS      ""
 #define DEVICE_ID      "esp32-audiocry"
 #define API_TOKEN      ""
 #define BACKEND_URL    "http://127.0.0.1:8000/api/cry-events"
@@ -45,15 +45,17 @@
  *  LED & BUTTONS
  *  ĐÃ CHUYỂN SANG ESP32-S3 30-PIN
  * ============================================================ */
-#define LED_STATUS_PIN     8
-#define BUTTON_DAY_PIN     9
-#define BUTTON_NIGHT_PIN   10
+#define LED_STATUS_PIN     8    // LED xanh dương on-board ESP32-S3 (Wi-Fi/status)
+#define BUTTON_DAY_PIN     9    // Nút duy nhất toggle Ngày/Đêm
+#define BUTTON_NIGHT_PIN   9    // alias cùng nút (giữ tương thích)
 #define LED_WIFI_PIN       LED_STATUS_PIN
 #define MODE_BUTTON_PIN    BUTTON_DAY_PIN   // tương thích code cũ
-#define LED_NIGHT_PIN      BUTTON_NIGHT_PIN
 #define LED_WIFI_ACTIVE_LOW 0   // 0 = active HIGH
-#define LED_CRY_RED_PIN    3
-#define LED_CRY_GREEN_PIN  LED_STATUS_PIN   // LED xanh lá = LED status/Wi-Fi
+
+// Đèn trạng thái bé & chế độ
+#define LED_CRY_GREEN_PIN  20   // Bé ngủ yên (xanh lá)
+#define LED_CRY_RED_PIN    21   // Bé khóc (đỏ)
+#define LED_NIGHT_PIN      38   // Đèn trắng: bật = ban ngày, tắt = ban đêm
 
 /* ============================================================
  *  I2C (tùy chọn)

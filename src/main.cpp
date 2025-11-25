@@ -104,16 +104,16 @@ static void updateCryLed(bool crying)
 {
     pinMode(LED_CRY_RED_PIN, OUTPUT);
     pinMode(LED_CRY_GREEN_PIN, OUTPUT);
-    // D4 (đỏ) sáng khi khóc, D5 (xanh lá) sáng khi không khóc
+    // LED do sang khi be khoc, LED xanh la sang khi be yen
     digitalWrite(LED_CRY_RED_PIN, crying ? HIGH : LOW);
     digitalWrite(LED_CRY_GREEN_PIN, crying ? LOW : HIGH);
 }
 static void updateNightLed()
 {
     pinMode(LED_NIGHT_PIN, OUTPUT);
-    digitalWrite(LED_NIGHT_PIN, nightMode ? HIGH : LOW);
+    // LED trang: bat khi ban ngay, tat khi ban dem
+    digitalWrite(LED_NIGHT_PIN, nightMode ? LOW : HIGH);
 }
-
 // Cry detector profile (ngày/đêm)
 struct DetectorProfile
 {
@@ -153,6 +153,7 @@ enum class SpeakCmd : uint8_t
 void setupWiFi();
 void setupGPS();
 void setupAudioCry();
+void setupSpeakerFeedback();
 void taskWifi(void *param);
 void taskGps(void *param);
 void taskApp(void *param);
@@ -160,7 +161,7 @@ void taskMic(void *param);
 void taskInfer(void *param);
 void taskSpeaker(void *param);
 void taskSender(void *param);
-bool parseNMEA(const String &line, GpsData &out);
+bool parseNMEA(const char *line, size_t len, GpsData &out);
 void startSetupAP();
 void stopSetupAP();
 void applyDetectorProfile();
@@ -332,7 +333,8 @@ void taskWifi(void *param)
 void taskGps(void *param)
 {
     Serial.println("[GPS] task started");
-    String line;
+    char lineBuf[160];
+    size_t idx = 0;
     uint32_t lastRx = millis();
     uint32_t lastAnyNmeaMs = millis();
     uint32_t lastSatsZeroMs = millis();
@@ -341,12 +343,14 @@ void taskGps(void *param)
         while (Serial2.available())
         {
             char c = Serial2.read();
-            if (c == '\n' || c == '\r')
+            if (c == '\r')
+                continue;
+            if (c == '\n')
             {
-                if (line.length() > 6)
+                if (idx > 6)
                 {
                     GpsData tmp;
-                    if (parseNMEA(line, tmp))
+                    if (parseNMEA(lineBuf, idx, tmp))
                     {
                         if (xSemaphoreTake(gGpsMutex, pdMS_TO_TICKS(10)) == pdTRUE)
                         {
@@ -366,11 +370,15 @@ void taskGps(void *param)
                         }
                     }
                 }
-                line = "";
+                idx = 0;
             }
             else
             {
-                line += c;
+                if (idx < sizeof(lineBuf) - 1)
+                {
+                    lineBuf[idx++] = c;
+                    lineBuf[idx] = '\0';
+                }
             }
             lastRx = millis();
         }
@@ -395,6 +403,7 @@ void taskApp(void *param)
     pinMode(LED_NIGHT_PIN, OUTPUT);
     updateNightLed();
     bool lastBtn = HIGH;
+    uint32_t lastChange = 0;
     uint32_t lastLog = 0;
     for (;;)
     {
@@ -415,8 +424,10 @@ void taskApp(void *param)
         }
         // toggle night mode
         bool btn = digitalRead(MODE_BUTTON_PIN) == LOW;
-        if (btn && !lastBtn)
+        uint32_t nowMs = millis();
+        if (btn && !lastBtn && (nowMs - lastChange) > 50)
         {
+            lastChange = nowMs;
             nightMode = !nightMode;
             applyDetectorProfile();
             if (ENABLE_AUDIOCRY)
@@ -436,11 +447,11 @@ void taskApp(void *param)
 #endif
             }
             updateNightLed();
-            // Nháy LED_wifi (LED xanh dương trên board) để báo đổi chế độ
-    digitalWrite(LED_WIFI_PIN, HIGH);
-    vTaskDelay(pdMS_TO_TICKS(150));
-    digitalWrite(LED_WIFI_PIN, LOW);
-            // Khôi phục trạng thái LED Wi-Fi theo kết nối hiện tại
+            // Nhay LED Wi-Fi (LED xanh duong tren board) de bao doi che do
+            digitalWrite(LED_WIFI_PIN, HIGH);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            digitalWrite(LED_WIFI_PIN, LOW);
+            // Khoi phuc trang thai LED Wi-Fi theo ket noi hien tai
             updateWifiLed(g_wifiConnected);
             Serial.printf("[MODE] nightMode=%s\n", nightMode ? "ON" : "OFF");
         }
@@ -616,9 +627,17 @@ void taskInfer(void *param)
         Serial.println("[AI] No infer buffer");
         vTaskDelete(nullptr);
     }
+    int retry = 0;
+    const int kMaxRetry = 6;
     while (!tflm_begin())
     {
+        retry++;
         Serial.println("[AI] Failed to init TFLM, retrying...");
+        if (retry >= kMaxRetry)
+        {
+            Serial.println("[AI] Disable AI (init failed / low RAM). Dùng S3 PSRAM hoặc giảm arena.");
+            vTaskDelete(nullptr);
+        }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     applyDetectorProfile();
@@ -725,42 +744,52 @@ static double nmeaToDeg(const String &v, const String &dir)
     return dec;
 }
 
-bool parseNMEA(const String &line, GpsData &out)
+bool parseNMEA(const char *line, size_t len, GpsData &out)
 {
-    std::vector<String> tok;
-    int start = 0;
-    while (true)
+    // token hóa nhẹ, tránh String để giảm phân mảnh heap
+    constexpr size_t MAX_TOK = 20;
+    const char *tokens[MAX_TOK] = {0};
+    size_t tok_count = 0;
+    // tạo bản sao tạm để strtok_r
+    char buf[160];
+    size_t copy_len = std::min(len, sizeof(buf) - 1);
+    memcpy(buf, line, copy_len);
+    buf[copy_len] = '\0';
+    char *saveptr = nullptr;
+    char *p = strtok_r(buf, ",", &saveptr);
+    while (p && tok_count < MAX_TOK)
     {
-        int idx = line.indexOf(',', start);
-        if (idx < 0)
-        {
-            tok.push_back(line.substring(start));
-            break;
-        }
-        tok.push_back(line.substring(start, idx));
-        start = idx + 1;
+        tokens[tok_count++] = p;
+        p = strtok_r(nullptr, ",", &saveptr);
     }
-    if (tok.empty())
+    if (tok_count == 0 || !tokens[0])
         return false;
 
-    if (tok[0].endsWith("GGA") && tok.size() > 9)
+    auto endsWith = [](const char *s, const char *suffix) {
+        size_t ls = strlen(s), lsf = strlen(suffix);
+        if (ls < lsf)
+            return false;
+        return strncmp(s + ls - lsf, suffix, lsf) == 0;
+    };
+
+    if (endsWith(tokens[0], "GGA") && tok_count > 9)
     {
-        out.lat = nmeaToDeg(tok[2], tok[3]);
-        out.lon = nmeaToDeg(tok[4], tok[5]);
-        out.fix = (tok[6].toInt() > 0);
-        out.sats = tok[7].toInt();
+        out.lat = nmeaToDeg(String(tokens[2]), String(tokens[3]));
+        out.lon = nmeaToDeg(String(tokens[4]), String(tokens[5]));
+        out.fix = (String(tokens[6]).toInt() > 0);
+        out.sats = String(tokens[7]).toInt();
         return true;
     }
-    if (tok[0].endsWith("RMC") && tok.size() > 11)
+    if (endsWith(tokens[0], "RMC") && tok_count > 11)
     {
-        if (tok[2] != "A")
+        if (tokens[2][0] != 'A')
         {
             out.fix = false;
             return true;
         }
-        out.lat = nmeaToDeg(tok[3], tok[4]);
-        out.lon = nmeaToDeg(tok[5], tok[6]);
-        out.speed = tok[7].toFloat() * 0.514444f; // knots -> m/s
+        out.lat = nmeaToDeg(String(tokens[3]), String(tokens[4]));
+        out.lon = nmeaToDeg(String(tokens[5]), String(tokens[6]));
+        out.speed = String(tokens[7]).toFloat() * 0.514444f; // knots -> m/s
         out.fix = true;
         return true;
     }

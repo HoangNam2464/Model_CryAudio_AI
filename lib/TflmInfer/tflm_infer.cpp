@@ -20,7 +20,7 @@
 
 namespace {
 
-// Arena đầy đủ cho model lớn
+// Arena dem cho model lon (co the giam neu thieu RAM tren S3 non-PSRAM)
 constexpr size_t kTensorArenaSize = 150 * 1024;  // 150 KB
 constexpr size_t kFeatureCount = kMelBins * kMelFrames;
 
@@ -128,6 +128,17 @@ bool tflm_begin() {
         if (g_resolver.AddAdd() != kTfLiteOk) return false;
         if (g_resolver.AddMaxPool2D() != kTfLiteOk) return false;
         resolver_init = true;
+    }
+
+    // Kiểm tra nhanh dung lượng heap trước khi cấp phát lớn
+    const size_t mel_bytes = kFeatureCount * sizeof(float);
+    const size_t safety_margin = 32 * 1024;  // 32 KB
+    const size_t need_bytes = kTensorArenaSize + mel_bytes + safety_margin;
+    size_t free_heap = esp_get_free_heap_size();
+    if (free_heap < need_bytes) {
+        Serial.printf("[AI] Not enough heap for TFLM (free=%u, need=%u). Disable AI or dùng PSRAM.\n",
+                      (unsigned)free_heap, (unsigned)need_bytes);
+        return false;
     }
 
     if (!g_tensor_arena) {

@@ -57,7 +57,7 @@
  * ============================================================ */
 #define LED_WIFI_GPIO          ((gpio_num_t)LED_WIFI_PIN)
 #define LED_CRY_RED_GPIO       ((gpio_num_t)LED_CRY_RED_PIN)
-#define LED_CRY_GREEN_GPIO     LED_WIFI_GPIO
+#define LED_CRY_GREEN_GPIO     ((gpio_num_t)LED_CRY_GREEN_PIN)
 #define MODE_BUTTON_GPIO       ((gpio_num_t)MODE_BUTTON_PIN)
 #define LED_NIGHT_GPIO         ((gpio_num_t)LED_NIGHT_PIN)
 
