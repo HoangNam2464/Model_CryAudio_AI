@@ -23,6 +23,10 @@ HardwareSerial Serial0(0);
 #include <CryDetector.h>
 #include <RestClient.h>
 #include <tflm_infer.h>
+#include "audio_service/audio_service.h"
+
+// Debug flags
+static constexpr bool LOG_GPS_RAW = true;
 
 // ====== Cờ bật/tắt AudioCry ======
 // Để test Wi-Fi + GPS trên DevKit không PSRAM, tắt AudioCry nếu thiếu RAM.
@@ -610,6 +614,7 @@ void taskGps(void *param)
     uint32_t lastRx = millis();
     uint32_t lastAnyNmeaMs = millis();
     uint32_t lastSatsZeroMs = millis();
+    int raw_logged = 0;
     for (;;)
     {
         while (Serial2.available())
@@ -633,13 +638,18 @@ void taskGps(void *param)
                         lastAnyNmeaMs = millis();
                         if (tmp.sats == 0)
                         {
-                            // nếu liên tục sats=0 quá 30s sẽ log cảnh báo
                             if (millis() - lastSatsZeroMs > 30000)
                             {
-                                log0("[GPS] Sats=0 >30s, kiểm tra anten/vị trí");
+                                log0("[GPS] Sats=0 >30s, kiem tra anten/vi tri");
                                 lastSatsZeroMs = millis();
                             }
                         }
+                    }
+                    else if (LOG_GPS_RAW && raw_logged < 5)
+                    {
+                        lineBuf[(idx < sizeof(lineBuf)) ? idx : (sizeof(lineBuf) - 1)] = '\0';
+                        logf("[GPS][RAW] %s", lineBuf);
+                        raw_logged++;
                     }
                 }
                 idx = 0;
@@ -661,7 +671,7 @@ void taskGps(void *param)
         }
         if (millis() - lastAnyNmeaMs > 30000)
         {
-            log0("[GPS] Dữ liệu bất thường, không thấy GGA/RMC >30s. Kiểm tra anten/chân RX/TX.");
+            log0("[GPS] Du lieu bat thuong, khong thay GGA/RMC >30s. Kiem tra anten/chan RX/TX.");
             lastAnyNmeaMs = millis();
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -831,44 +841,7 @@ static void playBeep(int freq, int durationMs, int volume)
 
 static void playVoice(const char *filename)
 {
-    if (!SPIFFS.begin(true))
-    {
-        log0("[SPK] SPIFFS mount failed");
-        return;
-    }
-    File f = SPIFFS.open(filename, "r");
-    if (!f)
-    {
-        logf("[SPK] Voice file missing: %s", filename);
-        return;
-    }
-    uint8_t header[44];
-    if (f.read(header, sizeof(header)) != sizeof(header))
-    {
-        log0("[SPK] WAV header read fail");
-        f.close();
-        return;
-    }
-    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0)
-    {
-        log0("[SPK] Not a WAV file");
-        f.close();
-        return;
-    }
-    const size_t chunk = 1024;
-    static std::vector<uint8_t> wavBuf;
-    wavBuf.resize(chunk);
-    while (true)
-    {
-        size_t r = f.read(wavBuf.data(), chunk);
-        if (r == 0)
-            break;
-        size_t written = 0;
-        i2s_write(SPK_I2S_PORT, wavBuf.data(), r, &written, pdMS_TO_TICKS(200));
-        if (written == 0)
-            break;
-    }
-    f.close();
+    // Deprecated: use audio_service playback functions instead.
 }
 
 void taskSpeaker(void *param)
@@ -881,22 +854,22 @@ void taskSpeaker(void *param)
             switch (ev)
             {
             case SpeakerEvent::EVENT_MODE_DAY:
-                playBeep(1000, 80, 4000);
+                playNightModeOff();
                 break;
             case SpeakerEvent::EVENT_MODE_NIGHT:
-                playBeep(800, 80, 3000);
+                playNightModeOn();
                 break;
             case SpeakerEvent::EVENT_CRY_DAY:
-                playVoice("/cry_day.wav");
+                playCryAlert();
                 break;
             case SpeakerEvent::EVENT_CALM_DAY:
-                playVoice("/calm_day.wav");
+                playCalmAlert();
                 break;
             case SpeakerEvent::EVENT_CRY_NIGHT:
-                playBeep(700, 120, 2500);
+                playCryAlert();
                 break;
             case SpeakerEvent::EVENT_CALM_NIGHT:
-                playBeep(600, 80, 1800);
+                playCalmAlert();
                 break;
             default:
                 break;
@@ -952,6 +925,7 @@ void taskInfer(void *param)
         g_lastProb = prob;
         g_lastScore = score;
         g_isCrying = state;
+        static uint32_t lastLogMs = 0;
         if (state != prevState)
         {
             updateCryLed(state);
@@ -994,8 +968,15 @@ void taskInfer(void *param)
                 }
             }
             prevState = state;
-            logf("[AI] State %s prob=%.3f score=%.3f night=%s",
-                 state ? "CRY" : "CALM", prob, score, nightMode ? "ON" : "OFF");
+            logf("[AI] prob_cry=%.3f state=%s score=%.3f night=%s",
+                 prob, state ? "CRY" : "CALM", score, nightMode ? "ON" : "OFF");
+            lastLogMs = millis();
+        }
+        else if (millis() - lastLogMs > 5000)
+        {
+            logf("[AI] prob_cry=%.3f state=%s score=%.3f night=%s",
+                 prob, state ? "CRY" : "CALM", score, nightMode ? "ON" : "OFF");
+            lastLogMs = millis();
         }
         filled = 0;
         vTaskDelay(pdMS_TO_TICKS((uint32_t)(INFER_INTERVAL_S * 1000)));
@@ -1029,13 +1010,22 @@ void taskSender(void *param)
         json += "\"score\":" + String(evt.score, 3) + ",";
         json += "\"lat\":" + String(evt.lat, 6) + ",";
         json += "\"lng\":" + String(evt.lon, 6) + ",";
-        json += "\"gps_valid\":";
-        json += (evt.gpsValid ? "true" : "false");
-        json += ",";
+        json += "\"gps_valid\":" + String(evt.gpsValid ? "true" : "false") + ",";
+        json += "\"cry_state\":\"" + String(evt.crying ? "CRY" : "CALM") + "\",";
+        json += "\"night_mode\":" + String(nightMode ? "true" : "false") + ",";
+        json += "\"gps_sats\":" + String(g_gps.sats) + ",";
         json += "\"duration_ms\":" + String(evt.durationMs) + ",";
         json += "\"ts\":" + String(evt.tsMs);
         json += "}";
-        RestClient::postJSON(BACKEND_URL, json);
+        int code = RestClient::postJSON(BACKEND_URL, json);
+        if (code >= 200 && code < 300)
+        {
+            logf("[HTTP] POST ok code=%d", code);
+        }
+        else
+        {
+            logf("[HTTP] POST fail code=%d", code);
+        }
     }
 }
 
@@ -1106,7 +1096,6 @@ bool parseNMEA(const char *line, size_t len, GpsData &out)
     return false;
 }
 
-// ==== Arduino setup/loop ====
 void setup()
 {
     Serial0.begin(115200);
@@ -1117,15 +1106,12 @@ void setup()
     setupWiFi();
     setupGPS();
     checkPsram();
-    setupAudioCry(); // Tạm comment để khoanh vùng reboot
+    setupAudioCry();
     setupWebServer();
-    // Khởi tạo LED báo trạng thái (tắt sẵn)
     updateCryLed(false);
     pinMode(LED_NIGHT_PIN, OUTPUT);
     updateNightLed();
     updateWifiLed(false);
-
-    // Luôn tạo speaker queue/task nếu có loa
 #if USE_MAX98357A_SPK
     if (!qSpeaker)
     {

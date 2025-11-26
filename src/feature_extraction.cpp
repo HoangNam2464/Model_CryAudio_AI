@@ -29,7 +29,7 @@ float MelToHz(float mel) {
 std::array<float, kMelBins * (kFftSize / 2 + 1)> BuildMelFilterbank() {
   constexpr int kNumFftBins = kFftSize / 2 + 1;
   std::array<float, kMelBins * kNumFftBins> filters{};
-  const float mel_low = HzToMel(0.0f);
+  const float mel_low = HzToMel(20.0f);
   const float mel_high = HzToMel(kSampleRate / 2.0f);
 
   std::array<float, kMelBins + 2> mel_points{};
@@ -68,32 +68,6 @@ std::array<float, kMelBins * (kFftSize / 2 + 1)> BuildMelFilterbank() {
 
 const std::array<float, kFrameLength> kHannWindow = MakeHannWindow();
 const std::array<float, kMelBins * (kFftSize / 2 + 1)> kMelFilters = BuildMelFilterbank();
-
-const std::array<float, kMelBins> kMelMean = {
-    0.096575916f, 0.213134080f, 0.140941516f, 0.219726443f, 0.171807364f, 0.312976509f,
-    0.335771203f, 0.461974174f, 0.441300780f, 0.462244242f, 0.402601004f, 0.399011105f,
-    0.371090919f, 0.407867700f, 0.428931475f, 0.466444492f, 0.479145825f, 0.474110842f,
-    0.476285309f, 0.444385052f, 0.438051671f, 0.393129021f, 0.352931112f, 0.348689407f,
-    0.293612033f, 0.285360992f, 0.272340894f, 0.257353574f, 0.232156426f, 0.241718903f,
-    0.216362521f, 0.206581697f, 0.172105521f, 0.161687672f, 0.152412146f, 0.152177364f,
-    0.149543688f, 0.132690787f, 0.124033310f, 0.093045078f, 0.074630715f, 0.046879392f,
-   -0.007031537f,-0.054310393f,-0.071843036f,-0.103770919f,-0.147775933f,-0.211251289f,
-   -0.275959909f,-0.395474494f,-0.558277488f,-0.590667725f,-0.628493249f,-0.651770949f,
-   -0.673963189f,-0.710214257f,-0.736975074f,-0.746896386f,-0.771948636f,-0.807865024f,
-   -0.844050467f,-0.899151921f,-0.977511287f,-1.138618469f};
-
-const std::array<float, kMelBins> kMelStd = {
-    1.092339635f, 1.067350984f, 1.000815988f, 0.917115629f, 0.884375870f, 0.928738236f,
-    0.986661732f, 1.022876620f, 1.018283606f, 0.980814338f, 0.956476271f, 0.939813256f,
-    0.947132051f, 0.961208045f, 0.976889610f, 0.988389969f, 0.990566492f, 0.987024546f,
-    0.986420870f, 0.976130784f, 0.961527944f, 0.955800235f, 0.954691231f, 0.950352192f,
-    0.932095647f, 0.916217029f, 0.908481896f, 0.903618813f, 0.900158107f, 0.899630129f,
-    0.889528334f, 0.872039616f, 0.851082325f, 0.841885507f, 0.844096482f, 0.852624834f,
-    0.854118943f, 0.859634042f, 0.865779758f, 0.869614303f, 0.877070487f, 0.886339664f,
-    0.869833469f, 0.858061969f, 0.849586546f, 0.840107620f, 0.829616964f, 0.822271347f,
-    0.811051786f, 0.792517066f, 0.806069493f, 0.805630326f, 0.802735448f, 0.810989022f,
-    0.804208398f, 0.792219281f, 0.781385958f, 0.777333617f, 0.778067470f, 0.758202016f,
-    0.751913786f, 0.740969658f, 0.772831738f, 0.745054305f};
 
 }  // namespace
 
@@ -140,7 +114,7 @@ bool ComputeLogMelSpectrogram(const int16_t* pcm, size_t num_samples, float* mel
       power_spectrum[i] = re * re + im * im;
     }
 
-    // Apply mel filterbank
+    // Apply mel filterbank (frame-major layout: frame outer, mel inner)
     for (int m = 0; m < kMelBins; ++m) {
       const float* filter = &kMelFilters[m * num_fft_bins];
       float mel_energy = 0.0f;
@@ -148,24 +122,29 @@ bool ComputeLogMelSpectrogram(const int16_t* pcm, size_t num_samples, float* mel
         mel_energy += filter[i] * power_spectrum[i];
       }
       mel_energy = std::log(std::max(mel_energy, kLogEps));
-      mel_out[m * kMelFrames + frame] = mel_energy;
+      const int idx = frame * kMelBins + m;
+      mel_out[idx] = mel_energy;
     }
+  }
+
+  // Global mean/std normalize (per full 20x25 window)
+  float mean = 0.0f;
+  const int total = kMelBins * kMelFrames;
+  for (int i = 0; i < total; ++i) mean += mel_out[i];
+  mean /= static_cast<float>(total);
+  float var = 0.0f;
+  for (int i = 0; i < total; ++i) {
+    float d = mel_out[i] - mean;
+    var += d * d;
+  }
+  var /= static_cast<float>(total);
+  float std = std::sqrt(std::max(var, kLogEps));
+  for (int i = 0; i < total; ++i) {
+    mel_out[i] = (mel_out[i] - mean) / std;
   }
 
   return true;
 }
 
-void StandardizeMelBands(float* mel_features) {
-  if (!mel_features) {
-    return;
-  }
-  for (int m = 0; m < kMelBins; ++m) {
-    const float mean = kMelMean[m];
-    const float std = kMelStd[m];
-    const float inv_std = 1.0f / std;
-    for (int t = 0; t < kMelFrames; ++t) {
-      const int idx = m * kMelFrames + t;
-      mel_features[idx] = (mel_features[idx] - mean) * inv_std;
-    }
-  }
-}
+// No-op: per-window normalization is already applied
+void StandardizeMelBands(float* /*mel_features*/) {}

@@ -12,7 +12,10 @@ extern HardwareSerial Serial0;
 #include <cstdint>
 #include <esp_attr.h>
 
-#include "crynet_model.h"
+#include "crynet_tiny_no_psram.h"
+
+// Nhúng trực tiếp model (đã loại khỏi src_filter nên không build thành .o riêng)
+#include "../../src/model/crynet_tiny_no_psram.cc"
 #include "feature_extraction.h"
 #include "esp_heap_caps.h"
 
@@ -20,11 +23,13 @@ extern HardwareSerial Serial0;
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/micro/kernels/reduce.cc"  // Register_MEAN
+#include "tensorflow/lite/micro/kernels/reduce_common.cc"
 
 namespace {
 
-// Arena dem cho model lon (co the giam neu thieu RAM tren S3 non-PSRAM)
-constexpr size_t kTensorArenaSize = 150 * 1024;  // 150 KB
+// Arena nhỏ cho model tiny (no-PSRAM)
+constexpr size_t kTensorArenaSize = 28 * 1024;  // 28 KB
 constexpr size_t kFeatureCount = kMelBins * kMelFrames;
 
 uint8_t* g_tensor_arena = nullptr;
@@ -87,7 +92,8 @@ float ReadOutputProb() {
     }
 
     const int count = OutputElementCount(g_output);
-    const int idx = (count >= 2) ? (count - 1) : 0;  // assume last logit = "cry"
+    // Mapping: output[0]=NOT_CRY, output[1]=CRY (model DS-CNN tiny). Fallback idx=0 if only 1 class.
+    const int idx = (count >= 2) ? 1 : 0;
     float prob = 0.0f;
 
     switch (g_output->type) {
@@ -114,10 +120,13 @@ float ReadOutputProb() {
 }  // namespace
 
 bool tflm_begin() {
-    g_model = tflite::GetModel(crynet_int8_tflite);
+    g_model = tflite::GetModel(crynet_tiny_no_psram);
     if (!g_model || g_model->version() != TFLITE_SCHEMA_VERSION) {
         return false;
     }
+    size_t free_int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_ps_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    Serial0.printf("[AI] heap before init int=%u psram=%u\n", (unsigned)free_int_before, (unsigned)free_ps_before);
 
     static bool resolver_init = false;
     if (!resolver_init) {
@@ -126,16 +135,13 @@ bool tflm_begin() {
         if (g_resolver.AddFullyConnected() != kTfLiteOk) return false;
         if (g_resolver.AddSoftmax() != kTfLiteOk) return false;
         if (g_resolver.AddReshape() != kTfLiteOk) return false;
-        if (g_resolver.AddAveragePool2D() != kTfLiteOk) return false;
-        if (g_resolver.AddMul() != kTfLiteOk) return false;
-        if (g_resolver.AddAdd() != kTfLiteOk) return false;
-        if (g_resolver.AddMaxPool2D() != kTfLiteOk) return false;
+        if (g_resolver.AddMean() != kTfLiteOk) return false;
         resolver_init = true;
     }
 
     // Kiểm tra nhanh dung lượng heap trước khi cấp phát lớn
     const size_t mel_bytes = kFeatureCount * sizeof(float);
-    const size_t safety_margin = 32 * 1024;  // 32 KB
+    const size_t safety_margin = 8 * 1024;  // 8 KB
     const size_t need_bytes = kTensorArenaSize + mel_bytes + safety_margin;
     size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -189,6 +195,16 @@ bool tflm_begin() {
     g_input = g_interpreter->input(0);
     g_output = g_interpreter->output(0);
     g_ready = (g_input != nullptr && g_output != nullptr);
+    Serial0.printf("[AI] TFLM ready. arena_used=%u bytes, input scale=%.6f zp=%d\n",
+                   (unsigned)g_interpreter->arena_used_bytes(),
+                   g_input ? g_input->params.scale : 0.0f,
+                   g_input ? g_input->params.zero_point : 0);
+    Serial0.printf("[AI] output scale=%.6f zp=%d\n",
+                   g_output ? g_output->params.scale : 0.0f,
+                   g_output ? g_output->params.zero_point : 0);
+    size_t free_int_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_ps_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    Serial0.printf("[AI] heap after init int=%u psram=%u\n", (unsigned)free_int_after, (unsigned)free_ps_after);
     return g_ready;
 }
 
@@ -200,7 +216,6 @@ float tflm_infer_prob(const int16_t* pcm, size_t n_samples) {
     if (!ComputeLogMelSpectrogram(pcm, n_samples, g_mel_buffer)) {
         return 0.0f;
     }
-    StandardizeMelBands(g_mel_buffer);
 
     if (!CopyFeaturesToInput()) {
         return 0.0f;

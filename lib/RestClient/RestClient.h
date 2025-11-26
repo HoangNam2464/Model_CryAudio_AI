@@ -6,16 +6,17 @@
 
 class RestClient {
 public:
-    static bool postJSON(const String& url, const String& json) {
-        if (WiFi.status() != WL_CONNECTED) return false;
+    // Trả về HTTP status code (hoặc -1 nếu lỗi kết nối/bắt đầu request)
+    static int postJSON(const String& url, const String& json) {
+        if (WiFi.status() != WL_CONNECTED) return -1;
         HTTPClient http;
-        if (!http.begin(url)) return false;
+        if (!http.begin(url)) return -1;
         http.addHeader("Content-Type", "application/json");
         if (String(API_TOKEN).length() > 0) {
             http.addHeader("Authorization", API_TOKEN);
         }
         int code = http.POST(json);
         http.end();
-        return code >= 200 && code < 300;
+        return code;
     }
 };
