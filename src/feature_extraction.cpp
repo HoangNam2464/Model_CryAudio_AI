@@ -86,8 +86,8 @@ bool ComputeLogMelSpectrogram(const int16_t* pcm, size_t num_samples, float* mel
     }
   }
 
-  std::array<float, kFftSize> frame_buffer{};
-  std::array<float, num_fft_bins> power_spectrum{};
+  static float frame_buffer[kFftSize];
+  static float power_spectrum[num_fft_bins];
 
   for (int frame = 0; frame < kMelFrames; ++frame) {
     const int offset = frame * kFrameHop;
@@ -95,9 +95,15 @@ bool ComputeLogMelSpectrogram(const int16_t* pcm, size_t num_samples, float* mel
     for (int i = 0; i < kFrameLength; ++i) {
       int idx = offset + i;
       float sample = 0.0f;
+      float prev = 0.0f;
       if (idx < static_cast<int>(num_samples)) {
         sample = static_cast<float>(pcm[idx]) / 32768.0f;
+        if (idx > 0) {
+          prev = static_cast<float>(pcm[idx - 1]) / 32768.0f;
+        }
       }
+      // Pre-emphasis to boost high freq
+      sample = sample - 0.95f * prev;
       frame_buffer[i] = sample * kHannWindow[i];
     }
     for (int i = kFrameLength; i < kFftSize; ++i) {
@@ -105,8 +111,8 @@ bool ComputeLogMelSpectrogram(const int16_t* pcm, size_t num_samples, float* mel
     }
 
     // FFT
-    std::array<kiss_fft_cpx, num_fft_bins> fft_out{};
-    kiss_fftr(cfg, frame_buffer.data(), fft_out.data());
+    static kiss_fft_cpx fft_out[num_fft_bins];
+    kiss_fftr(cfg, frame_buffer, fft_out);
 
     for (int i = 0; i < num_fft_bins; ++i) {
       const float re = fft_out[i].r;

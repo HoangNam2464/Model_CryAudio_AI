@@ -13,31 +13,29 @@
 #include <cstdio>
 #include <WebServer.h>
 #include <esp32-hal-psram.h>
+#include <Preferences.h>
 
-// Định nghĩa cổng log Serial0 (UART0)
 HardwareSerial Serial0(0);
 
 #include "Config.h"
 #include "board_config.h"
 #include "WifiConfig.h"
+#include "wifi_service.h"
 #include <CryDetector.h>
-#include <RestClient.h>
 #include <tflm_infer.h>
 #include "audio_service/audio_service.h"
+#include "backend_service.h"
+#include "wifi_portal.h"
 
-// Debug flags
-static constexpr bool LOG_GPS_RAW = true;
-
-// ====== Cờ bật/tắt AudioCry ======
-// Để test Wi-Fi + GPS trên DevKit không PSRAM, tắt AudioCry nếu thiếu RAM.
+static constexpr bool LOG_GPS_RAW = false;
+static constexpr float CRY_THRESHOLD = 0.80f;
 static constexpr bool ENABLE_AUDIOCRY = true;
-// Bật âm báo loa khi đổi night mode dù không chạy AI/mic (dùng I2S TX đơn giản)
-static constexpr bool ENABLE_SPEAKER_FEEDBACK = true;
+static constexpr bool ENABLE_SPEAKER_FEEDBACK = false;
 
 // ====== Wi-Fi cấu hình ======
 static const uint32_t WIFI_BACKOFF_MIN_MS = 1000;
 static const uint32_t WIFI_BACKOFF_MAX_MS = 30000;
-static const uint32_t WIFI_AP_FALLBACK_MS = 20000; // sau 20s mất link -> bật AP tạm
+static const uint32_t WIFI_AP_FALLBACK_MS = 20000;
 static const char *SETUP_AP_SSID = "AudioCry-Setup";
 static const char *SETUP_AP_PASS = "12345678";
 
@@ -52,7 +50,6 @@ static const int SPK_BCLK = SPK_I2S_BCLK_PIN;
 static const int SPK_LRCLK = SPK_I2S_LRCK_PIN;
 
 // ====== FreeRTOS handles ======
-TaskHandle_t hWifi = nullptr;
 TaskHandle_t hGps = nullptr;
 TaskHandle_t hApp = nullptr;
 TaskHandle_t hMic = nullptr;
@@ -79,34 +76,31 @@ static GpsData g_gps;
 static SemaphoreHandle_t gGpsMutex;
 
 // ====== Wi-Fi state ======
-static bool g_wifiConnected = false;
-static uint32_t g_lastWifiLostMs = 0;
-static bool g_apActive = false;
-static bool g_wifiReconnectRequested = false;
-static WifiCredentials g_wifiCreds;
 static WebServer g_webServer(80);
 static bool g_psramOk = false;
+static bool g_wifiConnected = false; // stub for legacy handlers
+static bool g_apActive = false;      // stub for legacy handlers
+static bool g_wifiReconnectRequested = false;
+static uint32_t g_lastWifiLostMs = 0;
 
 // ====== Cry event ======
 struct CryEvent
 {
-    bool crying;
-    bool heartbeat;
-    float prob;
-    float score;
-    double lat;
-    double lon;
-    bool gpsValid;
-    uint32_t tsMs;
-    uint32_t durationMs;
+    CryInfo cry;
+    GpsInfo gps;
 };
 
 // ====== Audio / AI ======
-static constexpr uint32_t PCM_POOL_BUFFERS = 3;
+static constexpr uint32_t PCM_POOL_BUFFERS = 2;
 static constexpr size_t TARGET_SAMPLES = static_cast<size_t>(I2S_SAMPLE_RATE * INFER_INTERVAL_S);
 static int16_t *g_inferWindow = nullptr;
 static uint32_t g_pcmBuffersAllocated = 0;
 static bool nightMode = false;
+static bool indoorMode = false;
+static char g_profileName[16] = "balanced";
+static Preferences g_appPrefs;
+static double g_fixedLat = 0;
+static double g_fixedLng = 0;
 static float g_lastProb = 0.0f;
 static float g_lastScore = 0.0f;
 static bool g_isCrying = false;
@@ -115,7 +109,25 @@ static uint32_t g_lastEventTs = 0;
 static double g_lastLat = 0;
 static double g_lastLng = 0;
 static bool g_gpsValid = false;
-static char g_statusMessage[64] = "Booting";
+char g_statusMessage[64] = "Booting";
+
+static int readBatteryPercent()
+{
+    // Placeholder until ADC-based battery measurement is hooked up.
+    return 87;
+}
+
+static DeviceStatus makeDeviceStatus()
+{
+    DeviceStatus st{};
+    strncpy(st.mode, nightMode ? "night" : "day", sizeof(st.mode) - 1);
+    st.mode[sizeof(st.mode) - 1] = '\0';
+    st.battery_percent = readBatteryPercent();
+    st.wifi_rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+    st.uptime_ms = millis();
+    WiFi.localIP().toString().toCharArray(st.device_ip, sizeof(st.device_ip));
+    return st;
+}
 // ==== Speaker helpers ====
 static void playBeep(int freq, int durationMs, int volume);
 static void playVoice(const char *filename);
@@ -141,14 +153,10 @@ void setStatusMessage(const char *msg)
     strncpy(g_statusMessage, msg, sizeof(g_statusMessage) - 1);
     g_statusMessage[sizeof(g_statusMessage) - 1] = '\0';
 }
-static void updateWifiLed(bool connected)
+static void app_state_set_mode(bool night, bool indoor)
 {
-    pinMode(LED_WIFI_PIN, OUTPUT);
-#if LED_WIFI_ACTIVE_LOW
-    digitalWrite(LED_WIFI_PIN, connected ? LOW : HIGH);
-#else
-    digitalWrite(LED_WIFI_PIN, connected ? HIGH : LOW);
-#endif
+    (void)night;
+    (void)indoor;
 }
 static void updateCryLed(bool crying)
 {
@@ -161,7 +169,7 @@ static void updateCryLed(bool crying)
 static void updateNightLed()
 {
     pinMode(LED_NIGHT_PIN, OUTPUT);
-    // LED trang: bat khi ban ngay, tat khi ban dem
+    // LED trắng: bật khi ban ngày, tắt khi ban đêm
     digitalWrite(LED_NIGHT_PIN, nightMode ? LOW : HIGH);
 }
 // Cry detector profile (ngày/đêm)
@@ -184,6 +192,66 @@ static constexpr DetectorProfile DAY_PROFILE{
     0.70f, 0.18f, 1.0f, 2.3f, 2.0f, 1.5f};
 static constexpr DetectorProfile NIGHT_PROFILE{
     0.78f, 0.22f, 1.5f, 2.8f, 2.5f, 2.0f};
+static constexpr DetectorProfile DAY_HIGH{
+    0.65f, 0.17f, 0.8f, 1.8f, 1.6f, 1.3f};
+static constexpr DetectorProfile NIGHT_HIGH{
+    0.72f, 0.20f, 1.2f, 2.3f, 2.0f, 1.7f};
+static constexpr DetectorProfile DAY_LOW_FALSE{
+    0.82f, 0.25f, 1.6f, 3.0f, 2.5f, 2.2f};
+static constexpr DetectorProfile NIGHT_LOW_FALSE{
+    0.86f, 0.28f, 1.8f, 3.2f, 2.8f, 2.4f};
+
+static const DetectorProfile &pickProfile(bool isNight)
+{
+    if (strncmp(g_profileName, "high_sensitivity", sizeof(g_profileName)) == 0)
+        return isNight ? NIGHT_HIGH : DAY_HIGH;
+    if (strncmp(g_profileName, "low_false_alarm", sizeof(g_profileName)) == 0)
+        return isNight ? NIGHT_LOW_FALSE : DAY_LOW_FALSE;
+    return isNight ? NIGHT_PROFILE : DAY_PROFILE;
+}
+
+static void saveProfileToNvs(const char *name)
+{
+    if (!name)
+        return;
+    if (!g_appPrefs.begin("app_cfg", false))
+        return;
+    g_appPrefs.putString("profile", name);
+    g_appPrefs.end();
+}
+
+static void loadProfileFromNvs()
+{
+    if (!g_appPrefs.begin("app_cfg", false))
+        return;
+    String p = g_appPrefs.getString("profile", "balanced");
+    if (p.length() >= (int)sizeof(g_profileName))
+        p = p.substring(0, sizeof(g_profileName) - 1);
+    strncpy(g_profileName, p.c_str(), sizeof(g_profileName) - 1);
+    g_profileName[sizeof(g_profileName) - 1] = '\0';
+    g_appPrefs.end();
+}
+
+static void saveIndoorToNvs()
+{
+    if (!g_appPrefs.begin("app_cfg", false))
+        return;
+    g_appPrefs.putBool("indoor", indoorMode);
+    g_appPrefs.putDouble("fix_lat", g_fixedLat);
+    g_appPrefs.putDouble("fix_lng", g_fixedLng);
+    g_appPrefs.end();
+}
+
+static void loadIndoorFromNvs()
+{
+    if (!g_appPrefs.begin("app_cfg", false))
+        return;
+    indoorMode = g_appPrefs.getBool("indoor", false);
+    g_fixedLat = g_appPrefs.getDouble("fix_lat", 0);
+    g_fixedLng = g_appPrefs.getDouble("fix_lng", 0);
+    g_appPrefs.end();
+    app_state_set_mode(nightMode, indoorMode);
+}
 
 // Speaker event
 enum class SpeakerEvent : uint8_t
@@ -197,13 +265,10 @@ enum class SpeakerEvent : uint8_t
 };
 
 // Forward declarations
-void setupWiFi();
 void setupGPS();
 void setupAudioCry();
-void setupSpeakerFeedback();
 void setupWebServer();
 void checkPsram();
-void taskWifi(void *param);
 void taskGps(void *param);
 void taskApp(void *param);
 void taskMic(void *param);
@@ -212,95 +277,54 @@ void taskSpeaker(void *param);
 void taskSender(void *param);
 void taskWeb(void *param);
 bool parseNMEA(const char *line, size_t len, GpsData &out);
-void startSetupAP();
-void stopSetupAP();
 void applyDetectorProfile();
+static void logSpiffsAudioFiles();
+static void audioSelfTest();
 
 // ==== CryDetector profile ====
 void applyDetectorProfile()
 {
-    const DetectorProfile &p = nightMode ? NIGHT_PROFILE : DAY_PROFILE;
+    const DetectorProfile &p = pickProfile(nightMode);
     detector.configure(p.onTh, p.offTh, p.stableOn, p.stableOff, p.minOn, p.minOff);
 }
 
-// ==== Wi-Fi event callback ====
-void handleWiFiEvent(WiFiEvent_t event)
+static void setDetectorProfileName(const char *name)
 {
-    switch (event)
-    {
-    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-        log0("[WiFi] Connected to AP");
-        updateWifiLed(true);
-        setStatusMessage("WiFi ket noi, cho IP...");
-        break;
-    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-        g_wifiConnected = true;
-        stopSetupAP();
-        logf("[WiFi] IP: %s", WiFi.localIP().toString().c_str());
-        updateWifiLed(true);
-        setStatusMessage("WiFi da ket noi");
-        break;
-    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-        g_wifiConnected = false;
-        g_lastWifiLostMs = millis();
-        log0("[WiFi] Lost");
-        updateWifiLed(false);
-        setStatusMessage("Mat WiFi, se fallback AP neu can.");
-        break;
-    default:
-        break;
-    }
-}
-
-// ==== Setup Wi-Fi ====
-void setupWiFi()
-{
-    wifi_config_init();
-    wifi_config_load(g_wifiCreds);
-    WiFi.mode(WIFI_STA);
-    WiFi.onEvent(handleWiFiEvent);
-    WiFi.persistent(false);
-    WiFi.setAutoReconnect(false);
-    WiFi.setSleep(false);
-    g_lastWifiLostMs = millis();
-    if (g_wifiCreds.ssid.isEmpty())
-    {
-        log0("[WiFi] No Wi-Fi credentials saved, enabling setup AP");
-        setStatusMessage("Chua co WiFi, dung AP cau hinh.");
-        startSetupAP();
-    }
-}
-
-// ==== AP fallback ====
-void startSetupAP()
-{
-    if (g_apActive)
+    if (!name)
         return;
-    if (WiFi.getMode() != WIFI_AP && WiFi.getMode() != WIFI_AP_STA)
+    strncpy(g_profileName, name, sizeof(g_profileName) - 1);
+    g_profileName[sizeof(g_profileName) - 1] = '\0';
+    saveProfileToNvs(g_profileName);
+    applyDetectorProfile();
+}
+
+static void logSpiffsAudioFiles()
+{
+    File root = SPIFFS.open("/audio");
+    if (!root || !root.isDirectory())
     {
-        WiFi.mode(WIFI_AP_STA);
+        log0("[AUDIO] Folder /audio not found in SPIFFS");
+        return;
     }
-    if (WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASS))
+    File f = root.openNextFile();
+    int count = 0;
+    while (f)
     {
-        g_apActive = true;
-        IPAddress ip = WiFi.softAPIP();
-        logf("[WiFi] AP fallback: %s / %s (IP %s)", SETUP_AP_SSID, SETUP_AP_PASS, ip.toString().c_str());
-        setStatusMessage("Dang mo AP cau hinh WiFi.");
+        count++;
+        logf("[AUDIO] file: %s (%u bytes)", f.name(), (unsigned)f.size());
+        f = root.openNextFile();
     }
-    else
+    if (count == 0)
     {
-        log0("[WiFi] Failed to start AP fallback");
+        log0("[AUDIO] No files under /audio in SPIFFS");
     }
 }
 
-void stopSetupAP()
+// Phát thử PCM để kiểm tra loa/I2S ngay khi boot
+static void audioSelfTest()
 {
-    if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA)
-    {
-        WiFi.softAPdisconnect(true);
-        WiFi.mode(WIFI_STA);
-    }
-    g_apActive = false;
+    log0("[AUDIO] Self-test: playing calm alert (PCM preferred)");
+    playCalmAlert();
 }
 
 // ==== PSRAM check ====
@@ -316,43 +340,11 @@ void checkPsram()
     else
     {
         log0("[PSRAM] Not detected. AI may fail; please use S3 with PSRAM or reduce model.");
-        setStatusMessage("PSRAM khong thay, AI co the tat.");
+        setStatusMessage("PSRAM không thấy, AI có thể tắt.");
     }
 }
 
 // ==== Web server (status + Wi-Fi config) ====
-static String htmlEscape(const String &in)
-{
-    String out;
-    out.reserve(in.length());
-    for (size_t i = 0; i < in.length(); ++i)
-    {
-        char c = in[i];
-        switch (c)
-        {
-        case '&':
-            out += F("&amp;");
-            break;
-        case '<':
-            out += F("&lt;");
-            break;
-        case '>':
-            out += F("&gt;");
-            break;
-        case '"':
-            out += F("&quot;");
-            break;
-        case '\'':
-            out += F("&#39;");
-            break;
-        default:
-            out += c;
-            break;
-        }
-    }
-    return out;
-}
-
 static void handleRoot()
 {
     g_webServer.send(200, "text/plain", "AudioCry ESP32 - OK");
@@ -385,78 +377,81 @@ static void handleStatusJson()
     g_webServer.send(200, "application/json", json);
 }
 
-static void handleWifiConfig()
+static bool loadTestAudio(int16_t *dst, size_t maxSamples, size_t &outSamples)
 {
-    WifiCredentials creds;
-    wifi_config_load(creds);
-    WifiCredentials updated = creds;
-    String message;
+    outSamples = 0;
+    File f = SPIFFS.open("/audio/test_cry.wav", "r");
+    if (!f)
+        return false;
+    if (f.size() < 44)
+        return false;
+    f.seek(44); // skip WAV header (assume PCM16 mono)
+    size_t toRead = maxSamples * sizeof(int16_t);
+    int bytes = f.read((uint8_t *)dst, toRead);
+    if (bytes <= 0)
+        return false;
+    outSamples = bytes / sizeof(int16_t);
+    return outSamples > 0;
+}
+
+static void handleSelfTest()
+{
+    static int16_t testBuf[TARGET_SAMPLES];
+    size_t got = 0;
+    if (!loadTestAudio(testBuf, TARGET_SAMPLES, got))
+    {
+        g_webServer.send(404, "application/json", "{\"ok\":false,\"error\":\"test_cry.wav missing or invalid\"}");
+        return;
+    }
+    float prob = tflm_infer_prob(testBuf, got);
+    char resp[128];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"prob\":%.3f,\"samples\":%u}", prob, (unsigned)got);
+    g_webServer.send(200, "application/json", resp);
+}
+
+static void handleDashboard()
+{
+    String html = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+    html += "<style>body{font-family:sans-serif;margin:1.5rem;} .card{border:1px solid #ccc;padding:1rem;border-radius:8px;margin-bottom:1rem;} h2{margin:0 0 .5rem 0;}</style></head><body>";
+    html += "<h2>AudioCry Dashboard</h2>";
+    html += "<div class='card'><strong>WiFi</strong><br>SSID: " + String(WiFi.SSID()) + "<br>RSSI: " + String(WiFi.RSSI()) + "<br>IP: " + WiFi.localIP().toString() + "</div>";
+    html += "<div class='card'><strong>AI</strong><br>Prob: " + String(g_lastProb, 3) + "<br>State: " + String(g_isCrying ? "CRYING" : "CALM") + "</div>";
+    html += "<div class='card'><strong>GPS</strong><br>Fix: " + String(g_gpsValid ? "YES" : "NO") + " sats=" + String(g_gps.sats) + "<br>Lat/Lng: " + String(g_lastLat, 6) + ", " + String(g_lastLng, 6) + "</div>";
+    html += "<div class='card'><strong>Mode</strong><br>Day/Night: " + String(nightMode ? "NIGHT" : "DAY") + "<br>Indoor: " + String(indoorMode ? "ON" : "OFF") + "<br>Status: " + String(g_statusMessage) + "</div>";
+    html += "</body></html>";
+    g_webServer.send(200, "text/html", html);
+}
+
+static void handleTestSpeaker()
+{
+    playTestTone();
+    g_webServer.send(200, "text/plain", "OK speaker");
+}
+
+static void handleTestAi() { handleSelfTest(); }
+
+static void handleSettings()
+{
     if (g_webServer.method() == HTTP_POST)
     {
-        String action = g_webServer.arg("action");
-        if (action == "delete")
-        {
-            wifi_config_clear();
-            creds = WifiCredentials{};
-            updated = creds;
-            g_wifiCreds = updated;
-            g_wifiReconnectRequested = true;
-            g_lastWifiLostMs = millis();
-            startSetupAP();
-            setStatusMessage("Chua co WiFi, dung AP cau hinh.");
-            message = F("Da xoa WiFi da luu.");
-        }
-        else
-        {
-            updated.ssid = g_webServer.arg("ssid");
-            updated.pass = g_webServer.arg("pass");
-            updated.ssid.trim();
-            wifi_config_save(updated);
-            g_wifiCreds = updated;
-            g_wifiReconnectRequested = true;
-            g_lastWifiLostMs = millis();
-            startSetupAP();
-            setStatusMessage("Da luu WiFi moi, dang ket noi...");
-            message = F("Da luu WiFi, doi vai giay de ket noi lai.");
-        }
+        indoorMode = g_webServer.arg("indoor") == "1";
+        g_fixedLat = g_webServer.arg("lat").toDouble();
+        g_fixedLng = g_webServer.arg("lng").toDouble();
+        String prof = g_webServer.arg("profile");
+        if (prof.length())
+            setDetectorProfileName(prof.c_str());
+        saveIndoorToNvs();
+        app_state_set_mode(nightMode, indoorMode);
     }
-    String html = F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>AudioCry WiFi</title><style>body{font-family:sans-serif;margin:2rem;}form{max-width:420px;padding:1rem;border:1px solid #ccc;border-radius:8px;}label{display:block;margin-top:0.8rem;font-weight:600;}input{width:100%;padding:0.4rem;margin-top:0.2rem;}button{margin-top:1rem;padding:0.6rem 1.2rem;} .msg{padding:0.6rem;background:#eef;border:1px solid #77f;border-radius:6px;margin-bottom:1rem;}</style></head><body>");
-    html += F("<h2>AudioCry ESP32 - Cau hinh WiFi</h2>");
-    if (message.length())
-    {
-        html += "<div class='msg'>" + message + "</div>";
-    }
-    html += "<p>Trang thai: <strong>" + htmlEscape(String(g_statusMessage)) + "</strong></p>";
-    if (g_wifiConnected)
-    {
-        html += "<p>Dang ket noi: <strong>" + htmlEscape(WiFi.SSID()) + "</strong> (IP " + WiFi.localIP().toString() + ")</p>";
-    }
-    else
-    {
-        html += F("<p>Chua ket noi WiFi.</p>");
-    }
-    if (g_apActive)
-    {
-        html += "<p>AP cau hinh: <strong>" + htmlEscape(String(SETUP_AP_SSID)) + "</strong> (pass " + String(SETUP_AP_PASS) + ", IP " + WiFi.softAPIP().toString() + ")</p>";
-    }
-    html += F("<section><h3>Saved Wi-Fi</h3>");
-    if (creds.ssid.length())
-    {
-        html += "<div><strong>" + htmlEscape(creds.ssid) + "</strong>";
-        html += F(" <form method='POST' style='display:inline;margin-left:0.5rem;'>");
-        html += F("<input type='hidden' name='action' value='delete'>");
-        html += F("<button type='submit'>Xoa</button></form></div>");
-    }
-    else
-    {
-        html += F("<p>Chua luu Wi-Fi nao.</p>");
-    }
-    html += F("</section>");
-    html += F("<form method='POST'>");
-    html += "<label>SSID</label><input name='ssid' maxlength='32' value='" + htmlEscape(updated.ssid) + "' placeholder='Ten WiFi'>";
-    html += "<label>Mat khau</label><input type='password' name='pass' maxlength='63' value='" + htmlEscape(updated.pass) + "' placeholder='Mat khau'>";
-    html += F("<button type='submit'>Luu</button></form>");
-    html += F("</body></html>");
+    String html = "<!doctype html><html><body><h3>Settings</h3><form method='POST'>";
+    html += "Indoor mode: <input type='checkbox' name='indoor' value='1' " + String(indoorMode ? "checked" : "") + "><br>";
+    html += "Fixed lat: <input name='lat' value='" + String(g_fixedLat, 6) + "'><br>";
+    html += "Fixed lng: <input name='lng' value='" + String(g_fixedLng, 6) + "'><br>";
+    html += "Profile: <select name='profile'>";
+    html += "<option value='balanced' " + String(strcmp(g_profileName, "balanced") == 0 ? "selected" : "") + ">balanced</option>";
+    html += "<option value='high_sensitivity' " + String(strcmp(g_profileName, "high_sensitivity") == 0 ? "selected" : "") + ">high_sensitivity</option>";
+    html += "<option value='low_false_alarm' " + String(strcmp(g_profileName, "low_false_alarm") == 0 ? "selected" : "") + ">low_false_alarm</option>";
+    html += "</select><br><button type='submit'>Save</button></form></body></html>";
     g_webServer.send(200, "text/html", html);
 }
 
@@ -464,8 +459,13 @@ void setupWebServer()
 {
     g_webServer.on("/", handleRoot);
     g_webServer.on("/status", handleStatusJson);
-    g_webServer.on("/wifi", HTTP_GET, handleWifiConfig);
-    g_webServer.on("/wifi", HTTP_POST, handleWifiConfig);
+    g_webServer.on("/dashboard", HTTP_GET, handleDashboard);
+    g_webServer.on("/self-test", HTTP_GET, handleSelfTest);
+    g_webServer.on("/test/ai", HTTP_GET, handleTestAi);
+    g_webServer.on("/test/speaker", HTTP_GET, handleTestSpeaker);
+    g_webServer.on("/settings", HTTP_GET, handleSettings);
+    g_webServer.on("/settings", HTTP_POST, handleSettings);
+    wifi_portal_register(g_webServer);
     g_webServer.begin();
     log0("[Web] HTTP server started on :80");
 }
@@ -494,32 +494,93 @@ void setupAudioCry()
     if (!needMic && !needSpeaker)
         return;
 
-    i2s_config_t cfg = {};
-    cfg.mode = I2S_MODE_MASTER;
-    if (needMic)
-        cfg.mode = (i2s_mode_t)(cfg.mode | I2S_MODE_RX);
-    if (needSpeaker)
-        cfg.mode = (i2s_mode_t)(cfg.mode | I2S_MODE_TX);
-    cfg.sample_rate = I2S_SAMPLE_RATE;
-    cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-    cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
-    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-    cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    cfg.dma_buf_count = 8;
-    cfg.dma_buf_len = I2S_READ_LEN;
-    cfg.use_apll = false;
-    cfg.tx_desc_auto_clear = needSpeaker;
-    cfg.fixed_mclk = 0;
+    const bool sharedPort = (MIC_I2S_PORT == SPK_I2S_PORT);
+    logf("[AUDIO] Config MIC port=%d WS=%d BCLK=%d SD=%d", MIC_I2S_PORT, MIC_WS, MIC_SCK, MIC_SD);
+    logf("[AUDIO] Config SPK port=%d BCLK=%d LRCK=%d DIN=%d", SPK_I2S_PORT, SPK_BCLK, SPK_LRCLK, SPK_DIN);
 
-    i2s_pin_config_t pins = {};
-    pins.bck_io_num = MIC_SCK;
-    pins.ws_io_num = MIC_WS;
-    pins.data_out_num = needSpeaker ? SPK_DIN : I2S_PIN_NO_CHANGE;
-    pins.data_in_num = needMic ? MIC_SD : I2S_PIN_NO_CHANGE;
+    if (sharedPort)
+    {
+        i2s_config_t cfg = {};
+        cfg.mode = I2S_MODE_MASTER;
+        if (needMic)
+            cfg.mode = (i2s_mode_t)(cfg.mode | I2S_MODE_RX);
+        if (needSpeaker)
+            cfg.mode = (i2s_mode_t)(cfg.mode | I2S_MODE_TX);
+        cfg.sample_rate = I2S_SAMPLE_RATE;
+        cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+        cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+        cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+        cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+        cfg.dma_buf_count = 8;
+        cfg.dma_buf_len = I2S_READ_LEN;
+        cfg.use_apll = false;
+        cfg.tx_desc_auto_clear = needSpeaker;
+        cfg.fixed_mclk = 0;
 
-    i2s_driver_install(MIC_I2S_PORT, &cfg, 0, nullptr);
-    i2s_set_pin(MIC_I2S_PORT, &pins);
-    i2s_set_clk(MIC_I2S_PORT, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+        i2s_pin_config_t pins = {};
+        pins.bck_io_num = MIC_SCK;
+        pins.ws_io_num = MIC_WS;
+        pins.data_out_num = needSpeaker ? SPK_DIN : I2S_PIN_NO_CHANGE;
+        pins.data_in_num = needMic ? MIC_SD : I2S_PIN_NO_CHANGE;
+
+        i2s_driver_install(MIC_I2S_PORT, &cfg, 0, nullptr);
+        i2s_set_pin(MIC_I2S_PORT, &pins);
+        i2s_set_clk(MIC_I2S_PORT, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    }
+    else
+    {
+        if (needMic)
+        {
+            i2s_config_t rxCfg = {};
+            rxCfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+            rxCfg.sample_rate = I2S_SAMPLE_RATE;
+            rxCfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+            rxCfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+            rxCfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+            rxCfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+            rxCfg.dma_buf_count = 8;
+            rxCfg.dma_buf_len = I2S_READ_LEN;
+            rxCfg.use_apll = false;
+            rxCfg.tx_desc_auto_clear = false;
+            rxCfg.fixed_mclk = 0;
+
+            i2s_pin_config_t rxPins = {};
+            rxPins.bck_io_num = MIC_SCK;
+            rxPins.ws_io_num = MIC_WS;
+            rxPins.data_out_num = I2S_PIN_NO_CHANGE;
+            rxPins.data_in_num = MIC_SD;
+
+            i2s_driver_install(MIC_I2S_PORT, &rxCfg, 0, nullptr);
+            i2s_set_pin(MIC_I2S_PORT, &rxPins);
+            i2s_set_clk(MIC_I2S_PORT, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+        }
+
+        if (needSpeaker)
+        {
+            i2s_config_t txCfg = {};
+            txCfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+            txCfg.sample_rate = I2S_SAMPLE_RATE;
+            txCfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+            txCfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+            txCfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+            txCfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+            txCfg.dma_buf_count = 8;
+            txCfg.dma_buf_len = I2S_READ_LEN;
+            txCfg.use_apll = false;
+            txCfg.tx_desc_auto_clear = true;
+            txCfg.fixed_mclk = 0;
+
+            i2s_pin_config_t txPins = {};
+            txPins.bck_io_num = SPK_BCLK;
+            txPins.ws_io_num = SPK_LRCLK;
+            txPins.data_out_num = SPK_DIN;
+            txPins.data_in_num = I2S_PIN_NO_CHANGE;
+
+            i2s_driver_install(SPK_I2S_PORT, &txCfg, 0, nullptr);
+            i2s_set_pin(SPK_I2S_PORT, &txPins);
+            i2s_set_clk(SPK_I2S_PORT, I2S_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+        }
+    }
 
     if (ENABLE_AUDIOCRY)
     {
@@ -532,79 +593,6 @@ void setupAudioCry()
         }
     }
 }
-// ==== Task Wi-Fi ====
-void taskWifi(void *param)
-{
-    uint32_t backoff = WIFI_BACKOFF_MIN_MS;
-    log0("[WiFiTask] start");
-    for (;;)
-    {
-        uint32_t now = millis();
-        if (g_wifiReconnectRequested)
-        {
-            g_wifiReconnectRequested = false;
-            WiFi.disconnect(true, true);
-            g_wifiConnected = false;
-            g_lastWifiLostMs = now;
-            backoff = WIFI_BACKOFF_MIN_MS;
-        }
-        if (!g_wifiConnected)
-        {
-            if (g_wifiCreds.ssid.isEmpty())
-            {
-                if (!g_apActive)
-                {
-                    startSetupAP();
-                }
-                setStatusMessage("Chua co WiFi, dung AP cau hinh.");
-                vTaskDelay(pdMS_TO_TICKS(400));
-                continue;
-            }
-
-            if (WiFi.getMode() == WIFI_AP)
-            {
-                WiFi.mode(WIFI_AP_STA);
-            }
-
-            logf("[WiFi] Connecting to %s...", g_wifiCreds.ssid.c_str());
-            setStatusMessage("Dang ket noi WiFi...");
-            WiFi.begin(g_wifiCreds.ssid.c_str(), g_wifiCreds.pass.c_str());
-
-            uint32_t t0 = millis();
-            while (!g_wifiConnected && (millis() - t0) < backoff)
-            {
-                vTaskDelay(pdMS_TO_TICKS(200));
-            }
-            if (g_wifiConnected)
-            {
-                log0("[WiFi] Connected");
-                backoff = WIFI_BACKOFF_MIN_MS;
-            }
-            else
-            {
-                logf("[WiFi] Retry in %u ms", backoff);
-                if (!g_apActive || (millis() - g_lastWifiLostMs) > WIFI_AP_FALLBACK_MS)
-                {
-                    startSetupAP();
-                }
-                g_lastWifiLostMs = millis();
-                backoff = std::min(backoff * 2, WIFI_BACKOFF_MAX_MS);
-            }
-        }
-        now = millis();
-        if (!g_wifiConnected && (now - g_lastWifiLostMs) > WIFI_AP_FALLBACK_MS)
-        {
-            startSetupAP();
-        }
-        static uint32_t lastLog = 0;
-        if (g_wifiConnected && now - lastLog > 5000)
-        {
-            log0("[WiFi] Link healthy");
-            lastLog = now;
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-}
 // ==== Task GPS ====
 void taskGps(void *param)
 {
@@ -615,6 +603,9 @@ void taskGps(void *param)
     uint32_t lastAnyNmeaMs = millis();
     uint32_t lastSatsZeroMs = millis();
     int raw_logged = 0;
+    static bool loggedNoData = false;
+    static bool loggedNoNmea = false;
+    static bool loggedZeroSat = false;
     for (;;)
     {
         while (Serial2.available())
@@ -636,13 +627,20 @@ void taskGps(void *param)
                             xSemaphoreGive(gGpsMutex);
                         }
                         lastAnyNmeaMs = millis();
+                        loggedNoNmea = false;
+                        loggedNoData = false;
                         if (tmp.sats == 0)
                         {
-                            if (millis() - lastSatsZeroMs > 30000)
+                            if ((millis() - lastSatsZeroMs > 30000) && !loggedZeroSat)
                             {
-                                log0("[GPS] Sats=0 >30s, kiem tra anten/vi tri");
+                                log0("[GPS] Sats=0 >30s, kiểm tra anten/vị trí...");
                                 lastSatsZeroMs = millis();
+                                loggedZeroSat = true;
                             }
+                        }
+                        else
+                        {
+                            loggedZeroSat = false;
                         }
                     }
                     else if (LOG_GPS_RAW && raw_logged < 5)
@@ -664,15 +662,15 @@ void taskGps(void *param)
             }
             lastRx = millis();
         }
-        if (millis() - lastRx > 5000)
+        if (millis() - lastRx > 5000 && !loggedNoData)
         {
             log0("[GPS] No data >5s");
-            lastRx = millis();
+            loggedNoData = true;
         }
+        // mute noisy warning about missing NMEA
         if (millis() - lastAnyNmeaMs > 30000)
         {
-            log0("[GPS] Du lieu bat thuong, khong thay GGA/RMC >30s. Kiem tra anten/chan RX/TX.");
-            lastAnyNmeaMs = millis();
+            loggedNoNmea = true;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -687,11 +685,13 @@ void taskApp(void *param)
     bool lastBtn = HIGH;
     uint32_t lastChange = 0;
     uint32_t lastLog = 0;
+    bool lastFixState = false;
+    bool loggedNoFix = false;
     for (;;)
     {
-        // log GPS mỗi 5s
+        // log GPS giảm spam: chỉ log khi thay đổi trạng thái hoặc định kỳ khi đã fix
         uint32_t now = millis();
-        if (now - lastLog > 5000)
+        if (now - lastLog > 5000 || lastFixState != g_gps.fix)
         {
             GpsData snapshot;
             if (xSemaphoreTake(gGpsMutex, pdMS_TO_TICKS(10)) == pdTRUE)
@@ -702,10 +702,20 @@ void taskApp(void *param)
             g_lastLat = snapshot.lat;
             g_lastLng = snapshot.lon;
             g_gpsValid = snapshot.fix;
-            logf("[GPS] Lat: %.6f, Lon: %.6f, Speed: %.2f, Sat: %u, Fix: %s",
-                 snapshot.lat, snapshot.lon, snapshot.speed,
-                 snapshot.sats, snapshot.fix ? "OK" : "NO");
-            lastLog = now;
+            if (snapshot.fix)
+            {
+                logf("[GPS] Lat: %.6f, Lon: %.6f, Speed: %.2f, Sat: %u, Fix: OK",
+                     snapshot.lat, snapshot.lon, snapshot.speed, snapshot.sats);
+                loggedNoFix = false;
+                lastLog = now;
+            }
+            else if (!loggedNoFix || lastFixState != snapshot.fix)
+            {
+                logf("[GPS] Chưa fix (Sat=%u). Đợi tín hiệu...", snapshot.sats);
+                loggedNoFix = true;
+                lastLog = now;
+            }
+            lastFixState = snapshot.fix;
         }
         // toggle night mode
         bool btn = digitalRead(MODE_BUTTON_PIN) == LOW;
@@ -726,8 +736,9 @@ void taskApp(void *param)
             vTaskDelay(pdMS_TO_TICKS(150));
             digitalWrite(LED_WIFI_PIN, LOW);
             // Khoi phuc trang thai LED Wi-Fi theo ket noi hien tai
-            updateWifiLed(g_wifiConnected);
+            wifi_update_led();
             logf("[MODE] nightMode=%s", nightMode ? "ON" : "OFF");
+            app_state_set_mode(nightMode, indoorMode);
         }
         lastBtn = btn;
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -851,6 +862,7 @@ void taskSpeaker(void *param)
     {
         if (xQueueReceive(qSpeaker, &ev, portMAX_DELAY) == pdTRUE)
         {
+            logf("[AUDIO] Speaker event=%d night=%s", static_cast<int>(ev), nightMode ? "ON" : "OFF");
             switch (ev)
             {
             case SpeakerEvent::EVENT_MODE_DAY:
@@ -938,42 +950,48 @@ void taskInfer(void *param)
                     ev = state ? SpeakerEvent::EVENT_CRY_DAY : SpeakerEvent::EVENT_CALM_DAY;
                 xQueueSend(qSpeaker, &ev, 0);
             }
-            CryEvent evt{};
-            evt.crying = state;
-            evt.heartbeat = false;
-            evt.prob = prob;
-            evt.score = score;
-            evt.tsMs = millis();
             GpsData snapshot{};
             if (xSemaphoreTake(gGpsMutex, pdMS_TO_TICKS(10)) == pdTRUE)
             {
                 snapshot = g_gps;
                 xSemaphoreGive(gGpsMutex);
             }
-            evt.lat = snapshot.lat;
-            evt.lon = snapshot.lon;
-            evt.gpsValid = snapshot.fix;
-            evt.durationMs = static_cast<uint32_t>(INFER_INTERVAL_S * 1000);
+            if (indoorMode)
+            {
+                snapshot.fix = false;
+                snapshot.lat = g_fixedLat;
+                snapshot.lon = g_fixedLng;
+                snapshot.sats = 0;
+            }
             g_lastLat = snapshot.lat;
             g_lastLng = snapshot.lon;
             g_gpsValid = snapshot.fix;
             strncpy(g_lastEvent, state ? "cry_on" : "cry_off", sizeof(g_lastEvent) - 1);
             g_lastEvent[sizeof(g_lastEvent) - 1] = '\0';
-            g_lastEventTs = evt.tsMs;
-            if (qEvents)
+            uint32_t nowMs = millis();
+            g_lastEventTs = nowMs;
+            if (state && prob >= CRY_THRESHOLD && qEvents)
             {
+                CryEvent evt{};
+                evt.cry.detected = true;
+                evt.cry.prob = prob;
+                strncpy(evt.cry.state, "CRYING", sizeof(evt.cry.state) - 1);
+                evt.cry.state[sizeof(evt.cry.state) - 1] = '\0';
+                evt.cry.threshold = CRY_THRESHOLD;
+                evt.cry.duration_ms = static_cast<uint32_t>(INFER_INTERVAL_S * 1000);
+                evt.cry.timestamp_ms = nowMs;
+                evt.gps.valid = snapshot.fix;
+                evt.gps.lat = snapshot.lat;
+                evt.gps.lng = snapshot.lon;
+                evt.gps.sats = snapshot.sats;
                 if (xQueueSend(qEvents, &evt, pdMS_TO_TICKS(10)) != pdTRUE)
                 {
                     log0("[AI] Event queue full");
                 }
+                logf("[AI] Baby cry detected, prob=%.3f, mode=%s",
+                     prob, nightMode ? "night" : "day");
             }
             prevState = state;
-            logf("[AI] prob_cry=%.3f state=%s score=%.3f night=%s",
-                 prob, state ? "CRY" : "CALM", score, nightMode ? "ON" : "OFF");
-            lastLogMs = millis();
-        }
-        else if (millis() - lastLogMs > 5000)
-        {
             logf("[AI] prob_cry=%.3f state=%s score=%.3f night=%s",
                  prob, state ? "CRY" : "CALM", score, nightMode ? "ON" : "OFF");
             lastLogMs = millis();
@@ -997,34 +1015,12 @@ void taskSender(void *param)
         if (xQueueReceive(qEvents, &evt, portMAX_DELAY) != pdTRUE)
             continue;
         // cần Wi-Fi sẵn sàng
-        uint32_t waitStart = millis();
-        while (!g_wifiConnected && millis() - waitStart < 15000)
+        wifi_ensure_connected(15000);
+        DeviceStatus st = makeDeviceStatus();
+        bool ok = sendCryEventToBackend(evt.cry, evt.gps, st);
+        if (!ok)
         {
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-        String json = "{";
-        json += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
-        const char *evtName = evt.heartbeat ? "cry_heartbeat" : (evt.crying ? "cry_on" : "cry_off");
-        json += "\"event\":\"" + String(evtName) + "\",";
-        json += "\"prob\":" + String(evt.prob, 3) + ",";
-        json += "\"score\":" + String(evt.score, 3) + ",";
-        json += "\"lat\":" + String(evt.lat, 6) + ",";
-        json += "\"lng\":" + String(evt.lon, 6) + ",";
-        json += "\"gps_valid\":" + String(evt.gpsValid ? "true" : "false") + ",";
-        json += "\"cry_state\":\"" + String(evt.crying ? "CRY" : "CALM") + "\",";
-        json += "\"night_mode\":" + String(nightMode ? "true" : "false") + ",";
-        json += "\"gps_sats\":" + String(g_gps.sats) + ",";
-        json += "\"duration_ms\":" + String(evt.durationMs) + ",";
-        json += "\"ts\":" + String(evt.tsMs);
-        json += "}";
-        int code = RestClient::postJSON(BACKEND_URL, json);
-        if (code >= 200 && code < 300)
-        {
-            logf("[HTTP] POST ok code=%d", code);
-        }
-        else
-        {
-            logf("[HTTP] POST fail code=%d", code);
+            log0("[HTTP] Failed to push cry event");
         }
     }
 }
@@ -1102,16 +1098,38 @@ void setup()
     delay(200);
     log0("[BOOT] start app");
     gGpsMutex = xSemaphoreCreateMutex();
+    loadProfileFromNvs();
+    loadIndoorFromNvs();
+    applyDetectorProfile();
+    app_state_set_mode(nightMode, indoorMode);
 
-    setupWiFi();
+    wifi_service_init();
+    wifi_service_start();
     setupGPS();
     checkPsram();
     setupAudioCry();
+    initBackendService();
+    // Mount SPIFFS early and verify audio files are present.
+    if (!audioInitFS())
+    {
+        log0("[Init] SPIFFS mount failed, speaker playback will not work");
+    }
+    else if (!SPIFFS.exists(AUDIO_ADPCM_NIGHT_ON) && !SPIFFS.exists(AUDIO_PCM_NIGHT_ON))
+    {
+        log0("[Init] Audio files missing in SPIFFS (/audio/*.wav). Upload data folder before testing speaker.");
+    }
+    else
+    {
+        logSpiffsAudioFiles();
+        audioSelfTest();
+        // Phát thêm tone 1 kHz 2s để kiểm tra phần cứng loa/I2S
+        playTestTone();
+    }
     setupWebServer();
     updateCryLed(false);
     pinMode(LED_NIGHT_PIN, OUTPUT);
     updateNightLed();
-    updateWifiLed(false);
+    wifi_update_led();
 #if USE_MAX98357A_SPK
     if (!qSpeaker)
     {
@@ -1120,7 +1138,6 @@ void setup()
     }
 #endif
 
-    xTaskCreatePinnedToCore(taskWifi, "wifi", 4096, nullptr, 2, &hWifi, 0);
     xTaskCreatePinnedToCore(taskGps, "gps", 4096, nullptr, 3, &hGps, 1);
     xTaskCreatePinnedToCore(taskApp, "app", 4096, nullptr, 1, &hApp, 1);
     xTaskCreatePinnedToCore(taskWeb, "web", 4096, nullptr, 1, nullptr, 1);
@@ -1148,3 +1165,4 @@ void loop()
 #include <Arduino.h>
 // UPDATE: Đã kiểm tra runtime theo dự án test (WiFi/HTTP, MIC/LOA/GPS, Flash)
 #include <WiFi.h>
+

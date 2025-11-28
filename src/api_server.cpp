@@ -5,6 +5,7 @@
 #include "Config.h"
 #include "WifiConfig.h"
 #include "wifi_service.h"
+#include "AppState.h"
 
 extern float g_lastProb;
 extern float g_lastScore;
@@ -12,7 +13,6 @@ extern bool  g_isCrying;
 extern double g_lastLat;
 extern double g_lastLng;
 extern bool   g_gpsValid;
-extern char   g_statusMessage[64];
 extern bool   nightMode;
 extern const char* g_lastEvent;
 extern uint32_t g_lastEventTs;
@@ -24,20 +24,7 @@ static void handleRoot(){
 }
 
 static void handleStatus(){
-    String json="{";
-    json += "\"device_id\":\""+String(DEVICE_ID)+"\",";
-    json += "\"ip\":\""+WiFi.localIP().toString()+"\",";
-    json += "\"prob\":"+String(g_lastProb,3)+",";
-    json += "\"score\":"+String(g_lastScore,3)+",";
-    json += "\"crying\":"; json += (g_isCrying ? "true":"false"); json += ",";
-    json += "\"lat\":"+String(g_lastLat,6)+",";
-    json += "\"lng\":"+String(g_lastLng,6)+",";
-    json += "\"gps_valid\":"; json += (g_gpsValid ? "true":"false"); json += ",";
-    json += "\"status\":\""+String(g_statusMessage)+"\",";
-    json += "\"night_mode\":"; json += (nightMode ? "true":"false"); json += ",";
-    json += "\"last_event\":\""+String(g_lastEvent)+"\",";
-    json += "\"last_event_ts\":"; json += String(g_lastEventTs);
-    json += "}";
+    String json = app_state_get_status_json();
     server.send(200, "application/json", json);
 }
 
