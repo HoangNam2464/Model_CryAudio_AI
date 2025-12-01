@@ -31,22 +31,11 @@ void setStatusMessage(const char *msg);
 #include "api_service.h"
 #include "wifi_portal.h"
 #include <time.h>
-
-String currentTimestamp()
-{
-    time_t now;
-    time(&now);
-
-    struct tm *tm_info = localtime(&now);
-
-    char buffer[32];
-    strftime(buffer, 32, "%Y-%m-%d %H:%M:%S", tm_info);
-
-    return String(buffer);
-}
+#include "utils_time.h"
+#include "device_id.h"
 
 static constexpr bool LOG_GPS_RAW = false;
-static constexpr float CRY_THRESHOLD = 0.80f;
+static constexpr float CRY_THRESHOLD = 0.65f;
 static constexpr bool ENABLE_AUDIOCRY = true;
 static constexpr bool ENABLE_SPEAKER_FEEDBACK = false;
 
@@ -74,7 +63,8 @@ TaskHandle_t hSpeaker = nullptr;
 TaskHandle_t hSender = nullptr;
 
 // ====== Queues ======
-static QueueHandle_t qPcm = nullptr;
+static QueueHandle_t qPcmFree = nullptr;
+static QueueHandle_t qPcmReady = nullptr;
 static QueueHandle_t qEvents = nullptr;
 static QueueHandle_t qSpeaker = nullptr;
 
@@ -94,8 +84,8 @@ static SemaphoreHandle_t gGpsMutex;
 // ====== Wi-Fi state ======
 static WebServer g_webServer(80);
 static bool g_psramOk = false;
-static bool g_wifiConnected = false; // stub for legacy handlers
-static bool g_apActive = false;      // stub for legacy handlers
+static bool g_wifiConnected = false;
+static bool g_apActive = false;
 static bool g_wifiReconnectRequested = false;
 static uint32_t g_lastWifiLostMs = 0;
 
@@ -136,7 +126,7 @@ void sendEventToBackend(bool cry, float prob, double lat, double lng, bool gpsVa
 {
     String mode = nightMode ? "NIGHT" : "DAY";
     int battery = readBatteryPercent();
-    int deviceId = 1;
+    int deviceId = device_id_int();
 
     String ts = currentTimestamp();
 
@@ -208,9 +198,19 @@ static void updateCryLed(bool crying)
 {
     pinMode(LED_CRY_RED_PIN, OUTPUT);
     pinMode(LED_CRY_GREEN_PIN, OUTPUT);
-    // LED do sang khi be khoc, LED xanh la sang khi be yen
-    digitalWrite(LED_CRY_RED_PIN, crying ? HIGH : LOW);
-    digitalWrite(LED_CRY_GREEN_PIN, crying ? LOW : HIGH);
+    // LED đỏ sáng khi bé khóc, LED xanh sáng khi bé yên
+    auto setLed = [](int pin, bool on)
+    {
+        digitalWrite(pin, LED_CRY_ACTIVE_LOW ? (on ? LOW : HIGH)
+                                             : (on ? HIGH : LOW));
+    };
+    setLed(LED_CRY_RED_PIN, crying);
+    setLed(LED_CRY_GREEN_PIN, !crying);
+    logf("[LED] crying=%d -> RED=%s GREEN=%s (active_low=%d)",
+         crying,
+         crying ? "ON" : "OFF",
+         crying ? "OFF" : "ON",
+         LED_CRY_ACTIVE_LOW);
 }
 static void updateNightLed()
 {
@@ -399,7 +399,7 @@ static void handleRoot()
 static void handleStatusJson()
 {
     String json = "{";
-    json += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+    json += "\"device_id\":\"" + device_id_str() + "\",";
     json += "\"ip_sta\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"ip_ap\":\"" + WiFi.softAPIP().toString() + "\",";
     json += "\"prob\":" + String(g_lastProb, 3) + ",";
@@ -541,8 +541,8 @@ void setupAudioCry()
         return;
 
     const bool sharedPort = (MIC_I2S_PORT == SPK_I2S_PORT);
-    logf("[AUDIO] Config MIC port=%d WS=%d BCLK=%d SD=%d", MIC_I2S_PORT, MIC_WS, MIC_SCK, MIC_SD);
-    logf("[AUDIO] Config SPK port=%d BCLK=%d LRCK=%d DIN=%d", SPK_I2S_PORT, SPK_BCLK, SPK_LRCLK, SPK_DIN);
+    // logf("[AUDIO] Config MIC port=%d WS=%d BCLK=%d SD=%d", MIC_I2S_PORT, MIC_WS, MIC_SCK, MIC_SD);
+    // logf("[AUDIO] Config SPK port=%d BCLK=%d LRCK=%d DIN=%d", SPK_I2S_PORT, SPK_BCLK, SPK_LRCLK, SPK_DIN);
 
     if (sharedPort)
     {
@@ -713,7 +713,7 @@ void taskGps(void *param)
             log0("[GPS] No data >5s");
             loggedNoData = true;
         }
-        // mute noisy warning about missing NMEA
+
         if (millis() - lastAnyNmeaMs > 30000)
         {
             loggedNoNmea = true;
@@ -814,8 +814,9 @@ void taskApp(void *param)
 // ==== PCM buffer pool ====
 static bool initPcmPool()
 {
-    qPcm = xQueueCreate(PCM_POOL_BUFFERS, sizeof(int16_t *));
-    if (!qPcm)
+    qPcmFree = xQueueCreate(PCM_POOL_BUFFERS, sizeof(int16_t *));
+    qPcmReady = xQueueCreate(PCM_POOL_BUFFERS, sizeof(int16_t *));
+    if (!qPcmFree || !qPcmReady)
         return false;
     uint32_t allocated = 0;
     for (uint32_t i = 0; i < PCM_POOL_BUFFERS; ++i)
@@ -829,7 +830,7 @@ static bool initPcmPool()
         }
         if (!buf)
             break;
-        xQueueSend(qPcm, &buf, 0);
+        xQueueSend(qPcmFree, &buf, 0);
         allocated++;
     }
     g_pcmBuffersAllocated = allocated;
@@ -839,7 +840,15 @@ static bool initPcmPool()
 static inline int16_t *acquirePcmBlock(TickType_t timeoutTicks)
 {
     int16_t *block = nullptr;
-    if (qPcm && xQueueReceive(qPcm, &block, timeoutTicks) == pdTRUE)
+    if (qPcmFree && xQueueReceive(qPcmFree, &block, timeoutTicks) == pdTRUE)
+        return block;
+    return nullptr;
+}
+
+static inline int16_t *takeReadyPcmBlock(TickType_t timeoutTicks)
+{
+    int16_t *block = nullptr;
+    if (qPcmReady && xQueueReceive(qPcmReady, &block, timeoutTicks) == pdTRUE)
         return block;
     return nullptr;
 }
@@ -848,7 +857,7 @@ static inline void releasePcmBlock(int16_t *block)
 {
     if (!block)
         return;
-    if (!qPcm || xQueueSend(qPcm, &block, 0) != pdTRUE)
+    if (!qPcmFree || xQueueSend(qPcmFree, &block, 0) != pdTRUE)
     {
         heap_caps_free(block);
     }
@@ -863,21 +872,17 @@ void taskMic(void *param)
     uint32_t blocksOk = 0;
 
     const size_t bytes_per_block = I2S_READ_LEN * sizeof(int16_t);
-    const TickType_t timeout = pdMS_TO_TICKS(80); // đủ để fill 1024 mẫu
+    const TickType_t timeout = pdMS_TO_TICKS(80);
 
     while (true)
     {
         esp_task_wdt_reset();
-
-        // Lấy block từ pool
         int16_t *block = acquirePcmBlock(pdMS_TO_TICKS(50));
         if (!block)
         {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
-
-        // Đọc I2S
         esp_err_t err = i2s_read(
             MIC_I2S_PORT,
             block,
@@ -923,13 +928,62 @@ void taskMic(void *param)
             }
         }
 
+        // ---------- Đếm block nhưng KHÔNG log ----------
         blocksOk++;
-        if (blocksOk % 200 == 0)
-            logf("[MIC] OK blocks=%u", blocksOk);
-        // ---------- Gửi block vào queue PCM ----------
-        if (xQueueSend(qPcm, &block, 0) != pdTRUE)
+        // (log OK blocks đã bị tắt hoàn toàn)
+
+        // ---------- Loại DC và giảm biên độ (tránh clip 0x7FFF) ----------
         {
+            const size_t samples = bytes_read / sizeof(int16_t);
+            int32_t sum = 0;
+            for (size_t i = 0; i < samples; ++i)
+                sum += block[i];
+            const int16_t mean = (samples > 0) ? static_cast<int16_t>(sum / (int32_t)samples) : 0;
+
+            for (size_t i = 0; i < samples; ++i)
+            {
+                int32_t v = static_cast<int32_t>(block[i]) - mean;
+                v >>= MIC_DOWNSHIFT_BITS;
+                if (v > 32767)
+                    v = 32767;
+                if (v < -32768)
+                    v = -32768;
+                block[i] = static_cast<int16_t>(v);
+            }
+        }
+
+        // ---------- Gửi block đã fill sang queue Ready ----------
+        if (!qPcmReady || xQueueSend(qPcmReady, &block, 0) != pdTRUE)
+        {
+            // Queue đầy hoặc chưa init -> trả lại pool
             releasePcmBlock(block);
+        }
+        else
+        {
+            // Ghi nhanh biên độ RMS/peak để chẩn đoán mic (log ~2s/lần)
+#if MIC_DEBUG_LOG
+            static uint32_t lastLogMs = 0;
+            uint32_t nowMs = millis();
+            if (nowMs - lastLogMs > 2000)
+            {
+                size_t samples = bytes_read / sizeof(int16_t);
+                double sumSq = 0.0;
+                int16_t peak = 0;
+                for (size_t i = 0; i < samples; ++i)
+                {
+                    int16_t v = block[i];
+                    int16_t a = (v >= 0) ? v : -v;
+                    if (a > peak)
+                        peak = a;
+                    sumSq += static_cast<double>(v) * static_cast<double>(v);
+                }
+                float rms = samples ? sqrtf(sumSq / samples) : 0.0f;
+                UBaseType_t freeCnt = qPcmFree ? uxQueueMessagesWaiting(qPcmFree) : 0;
+                UBaseType_t readyCnt = qPcmReady ? uxQueueMessagesWaiting(qPcmReady) : 0;
+                logf("[MIC] peak=%d rms=%.1f bytes=%u pool_free=%u ready=%u", peak, rms, (unsigned)bytes_read, (unsigned)freeCnt, (unsigned)readyCnt);
+                lastLogMs = nowMs;
+            }
+#endif
         }
 
         esp_task_wdt_reset();
@@ -939,31 +993,116 @@ void taskMic(void *param)
 // ==== Task Speaker ====
 static void playBeep(int freq, int durationMs, int volume)
 {
-    const size_t N = static_cast<size_t>(I2S_SAMPLE_RATE * (durationMs / 1000.0f));
-    static std::vector<int16_t> buf;
-    buf.resize(N);
-    for (size_t i = 0; i < N; ++i)
+    // Một block 256 mẫu → rất nhẹ, không fragment RAM
+    const size_t BLOCK = 256;
+    int16_t samples[BLOCK];
+
+    // Số mẫu cần phát
+    size_t totalSamples = (I2S_SAMPLE_RATE * durationMs) / 1000;
+
+    // Phát theo từng khối nhỏ
+    size_t generated = 0;
+
+    while (generated < totalSamples)
     {
-        float env = sinf(3.14159f * i / N);
-        float s = sinf(2.0f * 3.14159f * freq * i / I2S_SAMPLE_RATE) * env;
-        buf[i] = static_cast<int16_t>(s * volume);
-    }
-    const uint8_t *ptr = reinterpret_cast<const uint8_t *>(buf.data());
-    size_t bytesRemaining = buf.size() * sizeof(int16_t);
-    while (bytesRemaining > 0)
-    {
+        size_t n = std::min(BLOCK, totalSamples - generated);
+
+        for (size_t i = 0; i < n; i++)
+        {
+            float t = float(generated + i) / float(I2S_SAMPLE_RATE);
+            float env = sinf((float)M_PI * i / n); // tránh nổ bốp
+            float s = sinf(2.0f * (float)M_PI * freq * t) * env;
+
+            samples[i] = (int16_t)(s * volume);
+        }
+
         size_t written = 0;
-        i2s_write(SPK_I2S_PORT, ptr, bytesRemaining, &written, pdMS_TO_TICKS(200));
-        if (written == 0)
+        esp_err_t err = i2s_write(
+            SPK_I2S_PORT,
+            samples,
+            n * sizeof(int16_t),
+            &written,
+            pdMS_TO_TICKS(30) // timeout rất nhỏ → không block
+        );
+
+        if (err != ESP_OK)
+        {
+            Serial0.printf("[AUDIO] i2s_write err=%d\n", err);
             break;
-        ptr += written;
-        bytesRemaining -= written;
+        }
+
+        generated += n;
+
+        // Nhường CPU một chút cho FreeRTOS
+        vTaskDelay(1);
     }
 }
 
+// ====== Phát file WAV/ADPCM từ SPIFFS qua I2S ======
 static void playVoice(const char *filename)
 {
-    // Deprecated: use audio_service playback functions instead.
+    // if (!filename)
+    //     return;
+
+    // File f = SPIFFS.open(filename, "r");
+    // if (!f)
+    // {
+    //     Serial0.printf("[AUDIO] File not found: %s\n", filename);
+    //     return;
+    // }
+
+    // Serial0.printf("[AUDIO] Play voice: %s (%u bytes)\n", filename, (unsigned)f.size());
+
+    // // ---- WAV PCM16: bỏ 44 byte header ----
+    // bool isWav = false;
+    // if (strstr(filename, ".wav") || strstr(filename, ".WAV"))
+    // {
+    //     if (f.size() > 44)
+    //     {
+    //         f.seek(44);
+    //         isWav = true;
+    //     }
+    // }
+
+    // const size_t BLOCK = 512;
+    // uint8_t buf[BLOCK];
+    // size_t bytesRead = 0;
+
+    // while (true)
+    // {
+    //     bytesRead = f.read(buf, BLOCK);
+    //     if (bytesRead == 0)
+    //         break;
+
+    //     // WAV PCM16 → phát trực tiếp
+    //     if (isWav)
+    //     {
+    //         size_t written = 0;
+    //         esp_err_t err = i2s_write(
+    //             SPK_I2S_PORT,
+    //             buf,
+    //             bytesRead,
+    //             &written,
+    //             pdMS_TO_TICKS(30));
+
+    //         if (err != ESP_OK)
+    //         {
+    //             Serial0.printf("[AUDIO] i2s_write err=%d\n", err);
+    //             break;
+    //         }
+    //     }
+    //     else
+    //     {
+    //         // ADPCM / custom → gọi audio_service
+    //         audio_play_chunk(buf, bytesRead);
+    //     }
+
+    //     // Nhường CPU
+    //     vTaskDelay(1);
+    // }
+
+    // f.close();
+    // Serial0.printf("[AUDIO] Done: %s\n", filename);
 }
 
 void taskSpeaker(void *param)
@@ -1004,12 +1143,17 @@ void taskSpeaker(void *param)
 // ==== Task Infer ====
 void taskInfer(void *param)
 {
+    // Đảm bảo đã có buffer cho AI
     if (!g_inferWindow)
     {
         log0("[AI] No infer buffer");
         vTaskDelete(nullptr);
     }
 
+    // Đăng ký WDT cho task này
+    esp_task_wdt_add(nullptr);
+
+    // Khởi tạo TFLM (thử lại tối đa kMaxRetry lần)
     int retry = 0;
     const int kMaxRetry = 6;
     while (!tflm_begin())
@@ -1022,6 +1166,7 @@ void taskInfer(void *param)
             vTaskDelete(nullptr);
         }
         vTaskDelay(pdMS_TO_TICKS(500));
+        esp_task_wdt_reset();
     }
 
     applyDetectorProfile();
@@ -1031,10 +1176,13 @@ void taskInfer(void *param)
 
     for (;;)
     {
-        // Gom đủ TARGET_SAMPLES mẫu PCM cho 1 cửa sổ infer
+        // --------- Gom đủ TARGET_SAMPLES mẫu PCM cho 1 cửa sổ infer ---------
+        filled = 0;
         while (filled < TARGET_SAMPLES)
         {
-            int16_t *block = acquirePcmBlock(pdMS_TO_TICKS(10));
+            esp_task_wdt_reset();
+
+            int16_t *block = takeReadyPcmBlock(pdMS_TO_TICKS(10));
             if (block)
             {
                 size_t copy = std::min(TARGET_SAMPLES - filled, (size_t)I2S_READ_LEN);
@@ -1044,18 +1192,49 @@ void taskInfer(void *param)
             }
             else
             {
+                // Không có block mới → nhường CPU nhẹ
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
         }
 
-        // Chạy AI
+        esp_task_wdt_reset();
+
+        // --------- Chạy AI trên cửa sổ vừa gom ---------
         float prob = tflm_infer_prob(g_inferWindow, TARGET_SAMPLES);
+        if (prob < 0.0f)
+            prob = 0.0f;
+        if (prob > 1.0f)
+            prob = 1.0f;
+
         bool state = detector.update(prob);
         float score = detector.score();
 
         g_lastProb = prob;
         g_lastScore = score;
         g_isCrying = state;
+
+        // Log định kỳ để kiểm tra đường mic/AI (tắt mặc định tránh spam)
+#if AI_DEBUG_LOG
+        static uint32_t lastDbg = 0;
+        uint32_t nowDbg = millis();
+        if (nowDbg - lastDbg > 2000)
+        {
+            int16_t peak = 0;
+            double meanAbs = 0.0;
+            for (size_t i = 0; i < TARGET_SAMPLES; ++i)
+            {
+                int16_t v = g_inferWindow[i];
+                int16_t a = (v >= 0) ? v : -v;
+                if (a > peak)
+                    peak = a;
+                meanAbs += a;
+            }
+            meanAbs = meanAbs / TARGET_SAMPLES;
+            logf("[AI][DBG] prob=%.3f score=%.3f state=%s mean_abs=%.1f peak=%d",
+                 prob, score, state ? "CRY" : "CALM", meanAbs, peak);
+            lastDbg = nowDbg;
+        }
+#endif
 
         // 👉 Chỉ xử lý khi TRẠNG THÁI THAY ĐỔI (CALM ↔ CRY)
         if (state != prevState)
@@ -1130,16 +1309,17 @@ void taskInfer(void *param)
             }
 
             prevState = state;
-            if (!state) // CALM thì reset cờ gửi
+            if (!state) // CALM thì reset cờ gửi để lần CRY sau vẫn gửi được
                 lastWasCry = false;
 
             logf("[AI] prob_cry=%.3f state=%s score=%.3f night=%s",
                  prob, state ? "CRY" : "CALM", score, nightMode ? "ON" : "OFF");
         }
 
-        // Chuẩn bị cho cửa sổ kế tiếp
-        filled = 0;
-        vTaskDelay(pdMS_TO_TICKS((uint32_t)(INFER_INTERVAL_S * 1000)));
+        // Không delay bằng INFER_INTERVAL_S nữa,
+        // vì thời gian gom TARGET_SAMPLES đã ~ bằng INFER_INTERVAL_S rồi.
+        // Chỉ nhường CPU nhẹ để hệ thống thoáng.
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -1153,102 +1333,171 @@ void taskSender(void *param)
     }
 
     CryEvent evt;
-    static uint32_t lastSentMs = 0;
 
     for (;;)
     {
-        // Block tới khi nhận được sự kiện từ AI
+        // ===== 1. Chờ sự kiện từ AI =====
         if (xQueueReceive(qEvents, &evt, portMAX_DELAY) != pdTRUE)
             continue;
+
         if (!evt.cry.detected)
             continue;
 
+        // ===== 2. Chặn spam: chỉ CALM -> CRY mới gửi =====
         if (lastWasCry)
+            continue;
+
+        lastWasCry = true;
+
+        // ===== 3. Đảm bảo WiFi OK trước khi gửi =====
+        if (WiFi.status() != WL_CONNECTED)
         {
+            Serial0.println("[SEND] WiFi lost, waiting 1.5s...");
+
+            // Đợi nhẹ cho WiFi_task chạy reconnect
+            vTaskDelay(pdMS_TO_TICKS(1500));
+
+            if (WiFi.status() != WL_CONNECTED)
+            {
+                Serial0.println("[SEND] Still NO WiFi → skip event");
+                lastWasCry = false; // mở khóa để lần sau CRY mới gửi lại
+                continue;
+            }
+        }
+
+        bool ok = api_send_event(
+            evt.cry.detected,
+            evt.cry.prob,
+            nightMode ? "NIGHT" : "DAY",
+            evt.gps.valid,
+            evt.gps.lat,
+            evt.gps.lng,
+            100,
+            currentTimestamp(),
+            1);
+
+        if (!ok)
+        {
+            Serial0.println("[SEND] API failed (WiFi weak?) → NOT crash, skip safely");
+            lastWasCry = false;
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
-        lastWasCry = true;
-        lastSentMs = millis();
-        wifi_ensure_connected(15000);
-
-        // ---- Gửi về backend ----
-        sendEventToBackend(
-            evt.cry.detected,
-            evt.cry.prob,
-            evt.gps.lat,
-            evt.gps.lng,
-            evt.gps.valid);
-
-        logf("[SEND] Event sent: prob=%.3f lat=%.6f lng=%.6f valid=%d",
+        logf("[SEND] Event OK: prob=%.3f lat=%.6f lng=%.6f valid=%d",
              evt.cry.prob, evt.gps.lat, evt.gps.lng, evt.gps.valid);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
-// ==== Parser NMEA (GGA/RMC) ====
-static double nmeaToDeg(const String &v, const String &dir)
+static double nmeaToDeg(const char *v, const char *dir)
 {
-    if (v.length() < 4)
-        return 0;
-    double raw = v.toDouble();
-    int deg = int(raw / 100);
-    double minutes = raw - deg * 100;
-    double dec = deg + minutes / 60.0;
-    if (dir == "S" || dir == "W")
-        dec = -dec;
-    return dec;
+    if (!v || strlen(v) < 4)
+        return 0.0;
+
+    const char *dot = strchr(v, '.');
+    int len = dot ? (dot - v) : strlen(v);
+
+    if (len < 3)
+        return 0.0;
+
+    int degDigits = len - 2;
+
+    char degStr[8];
+    char minStr[16];
+
+    memset(degStr, 0, sizeof(degStr));
+    memset(minStr, 0, sizeof(minStr));
+
+    strncpy(degStr, v, degDigits);
+
+    strncpy(minStr, v + degDigits, sizeof(minStr) - 1);
+
+    double deg = atof(degStr);
+    double minutes = atof(minStr);
+
+    double result = deg + minutes / 60.0;
+
+    // Hướng Nam/Tây là số âm
+    if (dir && (dir[0] == 'S' || dir[0] == 'W'))
+        result = -result;
+
+    return result;
 }
 
 bool parseNMEA(const char *line, size_t len, GpsData &out)
 {
-    // token hóa nhẹ, tránh String để giảm phân mảnh heap
     constexpr size_t MAX_TOK = 20;
     const char *tokens[MAX_TOK] = {0};
     size_t tok_count = 0;
-    // tạo bản sao tạm để strtok_r
+
+    // Copy an toàn
     char buf[160];
-    size_t copy_len = std::min(len, sizeof(buf) - 1);
+    size_t copy_len = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
     memcpy(buf, line, copy_len);
     buf[copy_len] = '\0';
+
+    // Tách token
     char *saveptr = nullptr;
     char *p = strtok_r(buf, ",", &saveptr);
+
     while (p && tok_count < MAX_TOK)
     {
         tokens[tok_count++] = p;
         p = strtok_r(nullptr, ",", &saveptr);
     }
+
     if (tok_count == 0 || !tokens[0])
         return false;
 
+    // Helper endsWith
     auto endsWith = [](const char *s, const char *suffix)
     {
-        size_t ls = strlen(s), lsf = strlen(suffix);
+        size_t ls = strlen(s);
+        size_t lsf = strlen(suffix);
         if (ls < lsf)
             return false;
-        return strncmp(s + ls - lsf, suffix, lsf) == 0;
+        return memcmp(s + (ls - lsf), suffix, lsf) == 0;
     };
 
+    // ======== GGA ========
     if (endsWith(tokens[0], "GGA") && tok_count > 9)
     {
-        out.lat = nmeaToDeg(String(tokens[2]), String(tokens[3]));
-        out.lon = nmeaToDeg(String(tokens[4]), String(tokens[5]));
-        out.fix = (String(tokens[6]).toInt() > 0);
-        out.sats = String(tokens[7]).toInt();
+        // lat, N/S
+        out.lat = nmeaToDeg(tokens[2], tokens[3]);
+        // lon, E/W
+        out.lon = nmeaToDeg(tokens[4], tokens[5]);
+
+        // fix: '0' = invalid, >=1 = valid
+        out.fix = (tokens[6][0] > '0');
+
+        // number of satellites
+        out.sats = (uint8_t)atoi(tokens[7]);
+
         return true;
     }
+
+    // ======== RMC ========
     if (endsWith(tokens[0], "RMC") && tok_count > 11)
     {
-        if (tokens[2][0] != 'A')
+        // trạng thái fix
+        if (tokens[2][0] != 'A') // 'A' = Active, 'V' = Void
         {
             out.fix = false;
             return true;
         }
-        out.lat = nmeaToDeg(String(tokens[3]), String(tokens[4]));
-        out.lon = nmeaToDeg(String(tokens[5]), String(tokens[6]));
-        out.speed = String(tokens[7]).toFloat() * 0.514444f; // knots -> m/s
+
+        out.lat = nmeaToDeg(tokens[3], tokens[4]);
+        out.lon = nmeaToDeg(tokens[5], tokens[6]);
+
+        // Speed over ground (knots → m/s)
+        out.speed = atof(tokens[7]) * 0.514444f;
+
         out.fix = true;
         return true;
     }
+
     return false;
 }
 
@@ -1257,6 +1506,7 @@ void setup()
     Serial0.begin(115200);
     delay(200);
     log0("[BOOT] start app");
+    log0("[BOOT] ESP32 Crying Baby Detector");
     gGpsMutex = xSemaphoreCreateMutex();
     loadProfileFromNvs();
     loadIndoorFromNvs();
@@ -1269,20 +1519,21 @@ void setup()
     setupGPS();
     checkPsram();
     setupAudioCry();
-
-    // SPIFFS mount...
     if (!audioInitFS())
     {
-        log0("[Init] SPIFFS mount failed, speaker playback will not work");
-    }
-    else if (!SPIFFS.exists(AUDIO_ADPCM_NIGHT_ON) &&
-             !SPIFFS.exists(AUDIO_PCM_NIGHT_ON))
-    {
-        log0("[Init] Audio files missing in SPIFFS (/audio/*.wav). Upload data folder before testing speaker.");
+        log0("[Init] SPIFFS mount failed → audio playback disabled");
     }
     else
     {
-        logSpiffsAudioFiles();
+        if (!SPIFFS.exists(AUDIO_ADPCM_NIGHT_ON) &&
+            !SPIFFS.exists(AUDIO_PCM_NIGHT_ON))
+        {
+            log0("[Init] Audio files missing under /audio/");
+        }
+        else
+        {
+            logSpiffsAudioFiles();
+        }
     }
 
     setupWebServer();
@@ -1290,28 +1541,22 @@ void setup()
     pinMode(LED_NIGHT_PIN, OUTPUT);
     updateNightLed();
     wifi_update_led();
+    Serial0.println("[NET] Checking WiFi ready...");
+    bool wifiReady = wifi_ensure_connected(15000) &&
+                     (WiFi.status() == WL_CONNECTED);
 
-    delay(6000); // chờ WiFi kết nối
+    if (wifiReady)
+    {
+        Serial0.println("[NET] WiFi stable → syncing NTP...");
+        initNtp();
+        Serial0.println("[NET] NTP synced, waiting for real mic events to send.");
+    }
+    else
+    {
+        Serial0.println("[NET] WiFi NOT stable → will retry in wifi task");
+    }
 
-    int testDeviceId = 1; // ID thiết bị trong bảng thiet_bis
-    String ts = currentTimestamp();
-
-    Serial0.println("[TEST] Sending test cry event...");
-
-    api_send_event(
-        true,  // isCrying
-        0.92f, // prob
-        "DAY", // mode
-        false, // gpsValid
-        0.0,   // lat
-        0.0,   // lng
-        100,   // battery
-        ts,    // timestamp
-        testDeviceId);
-
-    Serial0.println("[TEST] Done sending");
-    // ====================================================================
-
+    // ====== 10. TASK SPEAKER ======
 #if USE_MAX98357A_SPK
     if (!qSpeaker)
     {
@@ -1320,22 +1565,25 @@ void setup()
     }
 #endif
 
-    // Tạo các task khác
+    // ====== 11. TASKS KHÁC ======
     xTaskCreatePinnedToCore(taskGps, "gps", 4096, nullptr, 3, &hGps, 1);
     xTaskCreatePinnedToCore(taskApp, "app", 4096, nullptr, 1, &hApp, 1);
     xTaskCreatePinnedToCore(taskWeb, "web", 4096, nullptr, 1, nullptr, 1);
+
+    // ====== 12. AUDIOCRY ======
     if (ENABLE_AUDIOCRY)
     {
         if (initPcmPool())
         {
             qEvents = xQueueCreate(6, sizeof(CryEvent));
+
             xTaskCreatePinnedToCore(taskMic, "mic", 3072, nullptr, 2, &hMic, 0);
             xTaskCreatePinnedToCore(taskInfer, "infer", 7168, nullptr, 1, &hInfer, 1);
             xTaskCreatePinnedToCore(taskSender, "sender", 3072, nullptr, 1, &hSender, 1);
         }
         else
         {
-            log0("[Init] Failed to init PCM pool, AudioCry disabled");
+            log0("[Init] Failed to init PCM pool → AudioCry disabled");
         }
     }
 }

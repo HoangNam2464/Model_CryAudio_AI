@@ -3,7 +3,8 @@
 
 #define WIFI_SSID      ""
 #define WIFI_PASS      ""
-#define DEVICE_ID      1
+// Để trống để tự sinh ID theo MAC (không trùng giữa các board). Chỉ đặt chuỗi cố định khi thật cần thiết.
+#define DEVICE_ID      ""
 #define API_TOKEN      ""
 #define BACKEND_URL    "http://192.168.1.110:8000/api/cry-events"
 
@@ -34,12 +35,25 @@
 #define LED_CRY_GREEN_PIN    48
 #define MODE_BUTTON_PIN      14
 
+#ifndef LED_CRY_ACTIVE_LOW
+#define LED_CRY_ACTIVE_LOW   0 // 1 nếu LED active-low (kéo xuống GND để sáng)
+#endif
+
+#ifndef MIC_DOWNSHIFT_BITS
+#define MIC_DOWNSHIFT_BITS   3
+#endif
+
+#ifndef MIC_DEBUG_LOG
+#define MIC_DEBUG_LOG 0
+#endif
+
+#ifndef AI_DEBUG_LOG
+#define AI_DEBUG_LOG 0
+#endif
+
 // I2C
 
 #define I2C_SDA_PIN        11
 #define I2C_SCL_PIN        12
 
 #endif // CONFIG_H
-
-
-

@@ -11,6 +11,7 @@
 #include "wifi_service.h"
 #include "log.h"
 #include "AppState.h"
+#include "device_id.h"
 
 extern HardwareSerial Serial0;
 
@@ -71,7 +72,7 @@ bool sendCryEventToBackend(const CryInfo &cry, const GpsInfo &gps, const DeviceS
     }
 
     JsonDocument doc;
-    doc["device_id"] = DEVICE_ID;
+    doc["device_id"] = device_id_str();
     doc["device_fw_version"] = (st.firmware[0] != '\0') ? st.firmware : DEVICE_FW_VERSION;
     doc["device_ip"] = st.device_ip;
     doc["esp32_chip_model"] = ESP.getChipModel();

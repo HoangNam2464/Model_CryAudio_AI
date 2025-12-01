@@ -26,7 +26,8 @@ static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 static constexpr EventBits_t WIFI_FAIL_BIT = BIT1;
 static constexpr EventBits_t WIFI_READY_BIT = WIFI_CONNECTED_BIT;
 static constexpr uint32_t WIFI_BACKOFF_MIN_MS = 1000;
-static constexpr uint32_t WIFI_BACKOFF_MAX_MS = 30000;
+// TĂNG MAX BACKOFF LÊN 60 GIÂY ĐỂ ĐỠ SPAM RECONNECT
+static constexpr uint32_t WIFI_BACKOFF_MAX_MS = 60000;
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr const char *CONFIG_AP_PASS = "";
 static bool g_setupApActive = false;
@@ -249,7 +250,8 @@ static bool wifi_connect_once(const WifiCredentials &creds, bool hasStoredCred)
 
     g_lastWifiReason = WIFI_REASON_UNSPECIFIED;
     WiFi.persistent(false);
-    WiFi.disconnect(false, true);
+    // NHẸ NHÀNG HƠN: KHÔNG ERASE CONFIG MỖI LẦN CONNECT
+    WiFi.disconnect(false, false);
     WiFi.setSleep(false);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
     WiFi.setAutoReconnect(false);
@@ -376,8 +378,10 @@ static void taskWifi(void *)
             g_wifiReconnectRequest = false;
             backoffMs = WIFI_BACKOFF_MIN_MS;
             g_authFailCount = 0;
-            WiFi.disconnect(true, true);
+            // QUAN TRỌNG: KHÔNG DÙNG disconnect(true,true) NỮA ĐỂ TRÁNH CRASH DRIVER
+            WiFi.disconnect(false, false);
             wifi_mark_disconnected();
+            vTaskDelay(pdMS_TO_TICKS(200)); // cho driver có thời gian settle
         }
 
         WifiCredentials creds;

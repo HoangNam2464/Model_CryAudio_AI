@@ -1,17 +1,17 @@
 #include "api_service.h"
 #include "Config.h"
+#include "device_id.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <HardwareSerial.h>
 
-// dùng cùng UART với toàn bộ project
 extern HardwareSerial Serial0;
 
 bool api_send_event(
     bool isCrying,
     float prob,
-    const String &mode,      // hiện không dùng nữa nhưng giữ tham số cho dễ gọi
+    const String &mode,
     bool gpsValid,
     double lat,
     double lng,
@@ -26,45 +26,46 @@ bool api_send_event(
     }
 
     HTTPClient http;
-    http.begin(BACKEND_URL);       // VD: http://192.168.1.110:8000/api/cry-events
-    http.setTimeout(4000);
-
+    http.setTimeout(3000);
+    http.begin(BACKEND_URL);
     http.addHeader("Content-Type", "application/json");
 
-    // JSON PHÙ HỢP LARAVEL (bạn đã sửa)
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
 
-    doc["device_id"] = deviceDbId;  // ID thiết bị trong DB
-    doc["lat"]       = lat;
-    doc["lng"]       = lng;
+    // Ưu tiên deviceDbId nếu caller truyền >0, nếu không sẽ lấy ID từ MAC (số).
+    int finalId = (deviceDbId > 0) ? deviceDbId : device_id_int();
+    doc["device_id"] = finalId;
+    doc["device_name"] = device_id_str();
+    doc["lat"] = lat;
+    doc["lng"] = lng;
     doc["is_crying"] = isCrying;
-    doc["prob"]      = prob;
+    doc["prob"] = prob;
     doc["timestamp"] = timestamp;
+    doc["gps_valid"] = gpsValid ? 1 : 0;
+    doc["battery"] = battery;
+    doc["mode"] = mode;
 
     String body;
     serializeJson(doc, body);
 
-    Serial0.print("[API] POST to: ");
-    Serial0.println(BACKEND_URL);
-    Serial0.println("[API] Sending JSON:");
-    Serial0.println(body);
+    Serial0.printf("[API] POST %s dev=%d(%s) cry=%d prob=%.2f gps=%d lat=%.6f lng=%.6f\n",
+                   BACKEND_URL, finalId, device_id_str().c_str(), isCrying, prob,
+                   gpsValid ? 1 : 0, lat, lng);
 
     int code = http.POST(body);
-
-    if (code == 200 || code == 201)
+    bool ok = (code == 200 || code == 201);
+    if (!ok)
     {
-        Serial0.printf("[API] OK sent, HTTP %d\n", code);
-        http.end();
-        return true;
+        String resp = http.getString();
+        if (resp.length() > 160)
+            resp = resp.substring(0, 160);
+        Serial0.printf("[API] FAIL code=%d resp=%s\n", code, resp.c_str());
+    }
+    else
+    {
+        Serial0.printf("[API] OK code=%d\n", code);
     }
 
-    Serial0.printf("[API] HTTP ERROR: %d\n", code);
-    String resp = http.getString();
-    if (resp.length())
-    {
-        Serial0.println("[API] Response body:");
-        Serial0.println(resp);
-    }
     http.end();
-    return false;
+    return ok;
 }
