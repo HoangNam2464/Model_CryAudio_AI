@@ -13,10 +13,14 @@ from tqdm import tqdm
 from torch import amp
 from torch.cuda.amp import GradScaler
 
-# ✅ sửa import: dùng tuyệt đối để tránh lỗi relative import
-from audioldm.models.crynet import build_crynet_small, build_crynet_large
+from audioldm.models.ds_cnn import build_ds_cnn
 from audioldm.dataset import CryDataset, labels_from_dataset, make_weighted_sampler
-from audioldm.audio_processing import load_standardization, save_standardization
+from audioldm.audio_processing import (
+    DEFAULT_MFCC_STATS,
+    load_standardization,
+    save_standardization,
+)
+
 
 def set_seed(seed: int = 1234):
     random.seed(seed)
@@ -97,16 +101,12 @@ def evaluate(model, loader, device, n_classes=2):
     return float(np.mean(losses)), acc, p, r, f1
 
 
-# ------------------------------
-# Main
-# ------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", type=str, default="data_new")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--model", choices=["small", "large"], default="small")
     ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--recompute_stats_if_missing", action="store_true")
     ap.add_argument("--seed", type=int, default=1234)
@@ -115,7 +115,7 @@ def main():
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"👉 Using device: {device}")
+    print(f"Using device: {device}")
     if device.type == "cuda":
         try:
             print("GPU:", torch.cuda.get_device_name(0))
@@ -125,26 +125,45 @@ def main():
     artifacts_dir = Path("artifacts")
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1️⃣ Chuẩn hóa dataset nếu cần
-    mean, std = load_standardization()
+    # Stats path cố định cho MFCC
+    stats_path = DEFAULT_MFCC_STATS
+    ckpt_path = artifacts_dir / "best_ds_cnn.pth"
+
+    # 1) Compute or load global stats
+    mean, std = load_standardization(stats_path)
     if mean is None or std is None or args.recompute_stats_if_missing:
-        raw_train = CryDataset(args.data_dir, split="train", use_global_stats=False)
+        raw_train = CryDataset(
+            args.data_dir,
+            split="train",
+            use_global_stats=False,
+            stats_path=stats_path,
+        )
         mean, std = compute_dataset_stats(raw_train, max_files=200)
-        save_standardization(mean, std)
-        print("✅ Saved new standardization.npz")
+        save_standardization(mean, std, stats_path=stats_path)
+        print("Saved new standardization stats (MFCC)")
 
-    # 2️⃣ Dataset có chuẩn hoá
-    train_ds = CryDataset(args.data_dir, split="train", use_global_stats=True)
-    val_ds = CryDataset(args.data_dir, split="val", use_global_stats=True)
+    # 2) Datasets with normalization
+    train_ds = CryDataset(
+        args.data_dir,
+        split="train",
+        use_global_stats=True,
+        stats_path=stats_path,
+    )
+    val_ds = CryDataset(
+        args.data_dir,
+        split="val",
+        use_global_stats=True,
+        stats_path=stats_path,
+    )
 
-    # 3️⃣ DataLoader
+    # 3) DataLoaders
     try:
         train_labels = labels_from_dataset(train_ds)
         sampler = make_weighted_sampler(train_labels)
         shuffle = False
     except Exception:
         sampler, shuffle = None, True
-        print("ℹ️ Weighted sampler disabled, fallback shuffle=True")
+        print("Weighted sampler disabled, fallback shuffle=True")
 
     train_loader = DataLoader(
         train_ds,
@@ -162,20 +181,15 @@ def main():
         pin_memory=(device.type == "cuda"),
     )
 
-    # 4️⃣ Model + Optimizer
+    # 4) Model + Optimizer
     n_classes = 2
-    if args.model == "small":
-        model = build_crynet_small(n_mels=64, n_classes=n_classes).to(device)
-        ckpt_path = artifacts_dir / "best_crynet_small.pth"
-    else:
-        model = build_crynet_large(n_mels=64, n_classes=n_classes).to(device)
-        ckpt_path = artifacts_dir / "best_crynet_large.pth"
+    model = build_ds_cnn(num_classes=n_classes).to(device)
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = GradScaler(enabled=(device.type == "cuda"))
 
-    # 5️⃣ Train loop
+    # 5) Train loop
     best_f1 = -1.0
     log = {"loss": [], "val_acc": [], "val_f1": []}
 
@@ -197,7 +211,7 @@ def main():
         if vl_f1 > best_f1:
             best_f1 = vl_f1
             torch.save(model.state_dict(), ckpt_path)
-            print(f"✅ Saved new best model to {ckpt_path} (F1={vl_f1:.3f})")
+            print(f"Saved new best model to {ckpt_path} (F1={vl_f1:.3f})")
 
     print(f"Done. Best F1={best_f1:.3f}")
 

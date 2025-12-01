@@ -29,7 +29,7 @@ def main():
     parser.add_argument(
         "--var_name",
         type=str,
-        default="crynet_int8_model",
+        default="ds_cnn_model",
         help="Name of the generated C array variable.",
     )
     parser.add_argument(

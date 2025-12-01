@@ -1,139 +1,112 @@
-# 🎧 AudioCryProject — Pipeline huấn luyện & xuất mô hình nhận diện tiếng khóc
+# AudioCryProject — AI pipeline (DS-CNN, MFCC 20×25)
 
-Hệ thống huấn luyện và xuất mô hình phân loại hai lớp **(cry / not_cry)** có thể chạy được cả trên **máy tính (desktop)** và **ESP32**.  
-Dự án này là nền tảng chính cho firmware **AudioCryESP32DevKit**.
+Repo này chỉ còn phần AI huấn luyện/convert cho mô hình DS-CNN nhỏ, dùng MFCC 20×25 (hop ~80 ms). Mã firmware/Log-Mel/CryNet đã được loại bỏ.
 
 ---
 
-## 🧩 Cấu trúc thư mục
-
+## Cấu trúc
 ```
 AudioCryProject/
-├── audioldm/          # Mã huấn luyện + tiền xử lý (PyTorch)
-├── artifacts/         # Checkpoint, model ONNX / TFLite / C array
-├── convert/           # Công cụ chuyển đổi định dạng mô hình
-├── data_new/          # Dữ liệu âm thanh (cry/, not_cry/)
-├── demos/             # Script demo ONNX (offline + realtime)
-├── evaluation/        # Đánh giá, kiểm thử mô hình
-├── dataset_tools/     # Công cụ hỗ trợ xử lý dữ liệu
-└── requirements.txt   # Danh sách thư viện Python cần cài đặt
+- audioldm/          # DS-CNN model, MFCC processing, dataset
+- artifacts/         # (sinh ra sau train/export)
+- convert/           # export_ds_cnn.py, convert_ds_cnn_int8.py, tflite_to_cc.py
+- data_new/          # dữ liệu audio (cry/, not_cry/)
+- dataset_tools/     # utility cho dữ liệu
+- train/             # (nếu có script huấn luyện bổ sung)
+- requirements.txt
 ```
 
 ---
 
-## ⚙️ 1. Cài đặt môi trường
-
+## Thiết lập môi trường
 ```bash
 python -m venv venv
-.
-env\Scripts ctivate
+source venv/Scripts/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 ---
 
-## 🎙️ 2. Chuẩn bị dữ liệu huấn luyện
-
-Đặt các file âm thanh WAV **mono 16 kHz** (~2 giây) vào hai thư mục sau:
-- `data_new/cry/`
-- `data_new/not_cry/`
-
-Lần huấn luyện đầu tiên sẽ tự động tính toán giá trị **mean/std toàn cục** và lưu trong `audioldm/standardization.npz`.  
-Các script hỗ trợ chia dữ liệu, tăng cường dữ liệu (augmentation),... nằm trong thư mục `dataset_tools/`.
+## Chuẩn bị dữ liệu
+- WAV mono 16 kHz (~2 s) vào:
+  - `data_new/cry/`
+  - `data_new/not_cry/`
 
 ---
 
-## 🧠 3. Huấn luyện mô hình CryNet
-
+## Huấn luyện DS-CNN (MFCC 20×25)
 ```bash
-# Mô hình nhỏ - phù hợp cho ESP32
-python -m audioldm.train_crynet --model small --data_dir data_new --epochs 30
+python -m audioldm.train_crynet --data_dir data_new --epochs 30
+```
+Sinh:
+- `artifacts/best_ds_cnn.pth`
+- `audioldm/standardization_mfcc.npz` (mean/std MFCC)
 
-# Mô hình lớn - cho inference trên desktop
-python -m audioldm.train_crynet --model large --data_dir data_new --epochs 30
+---
+
+## Export
+1) ONNX:
+```bash
+python convert/export_ds_cnn.py --ckpt artifacts/best_ds_cnn.pth --out artifacts/ds_cnn.onnx
+```
+2) TFLite INT8 (cần onnx-tf, và thư mục calib WAV đặt tại `convert/calib/`):
+```bash
+python convert/convert_ds_cnn_int8.py --onnx artifacts/ds_cnn.onnx
+```
+3) C array cho nhúng:
+```bash
+python convert/tflite_to_cc.py artifacts/ds_cnn_int8.tflite --var_name ds_cnn_model --output artifacts/ds_cnn_model.cc
 ```
 
-Kết quả huấn luyện (checkpoint, log, biểu đồ) sẽ được lưu trong thư mục `artifacts/`.
+---
+
+## Đánh giá / infer nhanh
+- `audioldm/evaluate.py` — chạy trên tập val (MFCC 20×25, model DS-CNN).
+- `audioldm/infer_file.py` — infer 1 file WAV với checkpoint DS-CNN.
+- `realtime.py` — test mic realtime (16 kHz, DS-CNN, MFCC 20×25).
 
 ---
 
-## 🧾 4. Xuất mô hình
+## Quy trình nhanh: thu thêm dữ liệu, huấn luyện, kiểm tra
 
-```bash
-# Xuất sang ONNX
-python convert/export_onnx.py --model small --ckpt artifacts/best_crynet_small.pth
+1) **Thu thêm not_cry/cry bằng mic** (mono 16 kHz, 2 giây/clip):
+   - Thủ công: `python mic_labeler.py --device_idx <ID_mic> --win_sec 2.0 --root data_new`
+     - Enter → lưu `not_cry`, `c` → lưu `cry`, `q` → thoát.
+   - Ghi liên tục not_cry: `python mic_labeler.py --device_idx <ID_mic> --win_sec 2.0 --root data_new --auto_not_cry`
+   - Để biết ID mic: `python -m sounddevice`
 
-# Chuyển đổi sang TensorFlow SavedModel (yêu cầu onnx-tf)
-python convert/convert_crynet.py artifacts/crynet_small.onnx
+2) **Huấn luyện lại DS-CNN** (tính lại mean/std):
+   ```bash
+   # xóa stats cũ nếu cần: del audioldm\standardization_mfcc.npz
+   python -m audioldm.train_crynet --data_dir data_new --epochs 30 --recompute_stats_if_missing
+   ```
+   - Checkpoint tốt nhất: `artifacts/best_ds_cnn.pth`
 
-# Chuyển đổi sang INT8 TFLite (dùng mẫu hiệu chỉnh trong convert/export_tf/assets/calib/)
-python convert/convert_crynet_int8.py
+3) **Kiểm tra toàn bộ tập dữ liệu** (tỉ lệ phân biệt cry/not_cry):
+   - Dùng `audioldm/evaluate.py` hoặc script soát toàn bộ (ví dụ):
+     ```bash
+     python -m audioldm.evaluate --data_dir data_new --ckpt artifacts/best_ds_cnn.pth
+     ```
+   - Hoặc tự viết nhỏ: load checkpoint, quét `data_new/cry` và `data_new/not_cry` → tính confusion.
 
-# Chuyển TFLite thành mảng C cho firmware ESP32
-python convert/tflite_to_cc.py artifacts/crynet_int8.tflite --var_name crynet_int8_model --output artifacts/crynet_int8_model.cc
-```
+4) **Test realtime trên mic** (giảm false positive):
+   ```bash
+   python realtime.py --threshold 0.7 --margin 0.2 --vote_win 3 --rms_gate_db -55 --prefilter --window_sec 2.0 --device_idx <ID_mic>
+   ```
+   - `threshold`/`margin`/`vote_win` giúp tránh nhầm nhạc.
 
-Các file tạo ra sẽ nằm trong `artifacts/`:
-
-- `crynet_small.onnx`
-- `crynet_fp32.tflite`, `crynet_fp16.tflite`, `crynet_int8.tflite`
-- `crynet_int8_model.cc` (mảng C để nhúng trực tiếp vào firmware)
-
----
-
-## 📊 5. Đánh giá & demo mô hình
-
-| Script | Chức năng |
-|---------|------------|
-| `evaluation/eval_metrics.py` | Tính confusion matrix & báo cáo accuracy |
-| `evaluation/eval_thresholds.py` | Quét ngưỡng phát hiện |
-| `demos/predict_one.py` | Chạy inference ONNX trên 1 file âm thanh |
-| `demos/offline_test.py` | Kiểm thử hàng loạt file trong thư mục |
-| `demos/realtime_onnx.py` | Demo nhận diện tiếng khóc thời gian thực (mic) |
-
-### 🧩 Demo thời gian thực (Realtime ONNX)
-Thiết lập đề xuất cho mic thu trong môi trường yên tĩnh:
-
-```bash
-python demos/realtime_onnx.py --model artifacts/crynet_small.onnx --on 0.70 --off 0.18 --ema 0.15 --stable_on 1.0 --stable_off 2.3 --min_on 2.0 --min_off 1.5 --block_dur 0.25 --smooth_win 0.8
-```
-
-**Giải thích tham số:**
-- `--smooth_win`: khoảng thời gian trượt trung bình xác suất (0–1.5s)  
-- `--block_dur`: độ dài mỗi khung xử lý (0.2–0.4s, càng nhỏ càng nhanh nhưng tốn CPU hơn)  
-- `--use_prefilter`, `--filter_low`, `--filter_high`: lọc dải tần (band-pass)  
-- `--use_noise_sub`: khử nhiễu nền (noise subtraction)
-
-Tất cả script demo đều dùng chung hàm tiền xử lý (`pad_or_trim`, `to_logmel`, `standardize`, `ensure_frame_length`).
+5) **Export sau khi hài lòng**:
+   ```bash
+   python convert/export_ds_cnn.py --ckpt artifacts/best_ds_cnn.pth --out artifacts/ds_cnn.onnx
+   python convert/convert_ds_cnn_int8.py --onnx artifacts/ds_cnn.onnx   # cần calib WAV ở convert/calib/
+   python convert/tflite_to_cc.py artifacts/ds_cnn_int8.tflite --var_name ds_cnn_model --output artifacts/ds_cnn_model.cc
+   ```
 
 ---
 
-## 🔩 6. Tích hợp với firmware ESP32
-
-Firmware ESP32 sẽ nhận mô hình **INT8 TFLite** và tái hiện đúng pipeline tiền xử lý:
-
-1. Ghi 1.3s âm thanh PCM ở 16kHz (20 800 mẫu).  
-2. Tạo spectrogram log-mel kích thước 64×128 (Hann window 25ms, hop 10ms, FFT 512).  
-3. Chuẩn hóa theo mean/std trong `standardization.npz`.  
-4. Lượng tử hóa đầu vào theo scale/zero-point và chạy inference.
-
-### Cách triển khai
-- Sao chép `artifacts/crynet_int8.tflite` vào `AudioCryESP32/models/` (nếu firmware load TFLite trực tiếp).  
-- Hoặc nhúng file `artifacts/crynet_int8_model.cc` vào code C++ với:
-  ```cpp
-  extern const unsigned char crynet_int8_model[];
-  ```
-
-Sau đó build & flash như thông thường bằng **PlatformIO**.
-
----
-
-## 👤 Tác giả
-- **Người phát triển:** nom_05  
-- **Dự án:** AudioCryProject (AI model) → AudioCryESP32DevKit (Firmware)  
-- **Liên kết GitLab:** [https://gitlab.com/tranvuonghung/sumo](https://gitlab.com/tranvuonghung/sumo)
-
----
-
-📘 *Mục tiêu:*  
-Huấn luyện mô hình AI nhẹ, có khả năng nhận diện tiếng khóc chính xác và hoạt động hiệu quả trên ESP32 trong hệ thống giám sát trẻ em thông minh.
+## Artifacts cần giữ (sau khi bạn chạy các bước trên)
+- `audioldm/standardization_mfcc.npz`
+- `artifacts/best_ds_cnn.pth`
+- `artifacts/ds_cnn.onnx`
+- `artifacts/ds_cnn_int8.tflite`
+- `artifacts/ds_cnn_model.cc`

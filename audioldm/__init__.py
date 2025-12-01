@@ -1,22 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-audioldm package
-----------------
-Gói chính cho toàn bộ pipeline nhận diện tiếng khóc em bé.
-Bao gồm các module:
-- models: Kiến trúc mạng CryNet (small / large)
-- dataset: Xử lý dữ liệu âm thanh huấn luyện (cry / not_cry)
-- audio_processing: Tiền xử lý âm thanh (log-mel, chuẩn hóa)
+audioldm package (DS-CNN + MFCC 20x25 only)
 """
 
-from .models.crynet import build_crynet_small, build_crynet_large, build_crynet
-from . import audio_processing
-from . import dataset
+from .models.ds_cnn import build_ds_cnn  # noqa: F401
+from . import audio_processing  # noqa: F401
+from . import dataset  # noqa: F401
 
 __all__ = [
-    "build_crynet_small",
-    "build_crynet_large",
-    "build_crynet",
+    "build_ds_cnn",
     "audio_processing",
     "dataset",
 ]

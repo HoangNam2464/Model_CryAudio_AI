@@ -1,6 +1,5 @@
 import argparse
 from pathlib import Path
-
 import torch
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -11,20 +10,12 @@ import sys
 
 sys.path.append(str(PROJECT_ROOT))
 
-from audioldm.models.crynet import (
-    build_crynet_large,
-    build_crynet_small,
-)
+from audioldm.models.ds_cnn import build_ds_cnn  # noqa: E402
 
 
-def export_to_onnx(model_size: str, ckpt_path: Path, output_path: Path) -> None:
+def export_to_onnx(ckpt_path: Path, output_path: Path) -> None:
     device = torch.device("cpu")
-    n_classes = 2
-
-    if model_size == "small":
-        model = build_crynet_small(n_mels=64, n_classes=n_classes).to(device)
-    else:
-        model = build_crynet_large(n_mels=64, n_classes=n_classes).to(device)
+    model = build_ds_cnn(num_classes=2).to(device)
 
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -35,7 +26,7 @@ def export_to_onnx(model_size: str, ckpt_path: Path, output_path: Path) -> None:
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    dummy_input = torch.randn(1, 1, 64, 128, device=device)
+    dummy_input = torch.randn(1, 1, 20, 25, device=device)
     torch.onnx.export(
         model,
         dummy_input,
@@ -45,28 +36,27 @@ def export_to_onnx(model_size: str, ckpt_path: Path, output_path: Path) -> None:
         dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
         opset_version=12,
     )
-    print(f"✅ Exported ONNX model to {output_path}")
+    print(f"Exported ONNX model to {output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export CryNet checkpoint to ONNX")
-    parser.add_argument(
-        "--model",
-        choices=["small", "large"],
-        default="small",
-        help="Architecture variant",
-    )
+    parser = argparse.ArgumentParser(description="Export DS-CNN checkpoint to ONNX")
     parser.add_argument(
         "--ckpt",
         type=str,
-        default=str(ARTIFACTS_DIR / "best_crynet_small.pth"),
+        default=str(ARTIFACTS_DIR / "best_ds_cnn.pth"),
         help="Path to .pth checkpoint",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=str(ARTIFACTS_DIR / "ds_cnn.onnx"),
+        help="Output ONNX path",
     )
     args = parser.parse_args()
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_name = f"crynet_{args.model}.onnx"
-    export_to_onnx(args.model, Path(args.ckpt), ARTIFACTS_DIR / out_name)
+    export_to_onnx(Path(args.ckpt), Path(args.out))
 
 
 if __name__ == "__main__":
