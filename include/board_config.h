@@ -21,8 +21,7 @@
 #define INFER_INTERVAL_S             1.0f
 #endif
 
-/* ===================== MIC INMP441 ===================== */
-#define MIC_I2S_PORT           I2S_NUM_1
+#define MIC_I2S_PORT           I2S_NUM_0
 #define MIC_I2S_GPIO_WS        ((gpio_num_t)I2S_WS_PIN)      // 4
 #define MIC_I2S_GPIO_SCK       ((gpio_num_t)I2S_SCK_PIN)     // 5
 #define MIC_I2S_GPIO_DATA_IN   ((gpio_num_t)I2S_SD_PIN)      // 6
@@ -33,8 +32,7 @@
 #define I2S_RX_LRCK_GPIO       MIC_I2S_GPIO_WS
 #define I2S_RX_DIN_GPIO        MIC_I2S_GPIO_DATA_IN
 
-/* ===================== SPEAKER MAX98357A ===================== */
-#define SPK_I2S_PORT           I2S_NUM_0
+#define SPK_I2S_PORT           I2S_NUM_1
 #define SPK_I2S_GPIO_DATA_OUT  ((gpio_num_t)I2S_SD_OUT_PIN)   // 7
 #define SPK_I2S_GPIO_BCLK      ((gpio_num_t)SPK_I2S_BCLK_PIN) // 15
 #define SPK_I2S_GPIO_LRCK      ((gpio_num_t)SPK_I2S_LRCK_PIN) // 16
@@ -45,25 +43,20 @@
 #define I2S_TX_LRCK_GPIO       SPK_I2S_GPIO_LRCK
 #define I2S_TX_DOUT_GPIO       SPK_I2S_GPIO_DATA_OUT
 
-/* ===================== GPS NEO-6M ===================== */
-/* SỬA THEO YÊU CẦU: dùng chân 17 và 18 */
 #define GPS_UART_NUM           UART_NUM_2
-#define GPS_RX_GPIO            ((gpio_num_t)GPS_RX_PIN)    // 17  (GPS TX → ESP32 RX)
-#define GPS_TX_GPIO            ((gpio_num_t)GPS_TX_PIN)    // 18  (ESP32 TX → GPS RX)
+#define GPS_RX_GPIO            ((gpio_num_t)GPS_RX_PIN)
+#define GPS_TX_GPIO            ((gpio_num_t)GPS_TX_PIN)
 #define GPS_BAUDRATE           GPS_BAUD
 
-/* ===================== LED & BUTTON ===================== */
 #define LED_CRY_RED_GPIO       ((gpio_num_t)LED_CRY_RED_PIN)
 #define LED_CRY_GREEN_GPIO     ((gpio_num_t)LED_CRY_GREEN_PIN)
 #define LED_NIGHT_GPIO         ((gpio_num_t)LED_NIGHT_PIN)
 #define MODE_BUTTON_GPIO       ((gpio_num_t)MODE_BUTTON_PIN)
 
-/* ===================== I2C ===================== */
 #define I2C_SDA_GPIO           ((gpio_num_t)I2C_SDA_PIN)
 #define I2C_SCL_GPIO           ((gpio_num_t)I2C_SCL_PIN)
 #define I2C_FREQ_HZ            400000
 
-/* ===================== NVS AUDIO ===================== */
 #define NVS_NAMESPACE_AUDIO      "audio_cfg"
 #define NVS_KEY_OUTPUT_VOLUME    "vol_out"
 

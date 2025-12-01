@@ -21,6 +21,9 @@ HardwareSerial Serial0(0);
 #include "board_config.h"
 #include "WifiConfig.h"
 #include "wifi_service.h"
+void log0(const String &msg);
+void setStatusMessage(const char *msg);
+
 #include <CryDetector.h>
 #include <tflm_infer.h>
 #include "audio_service/audio_service.h"
@@ -148,6 +151,7 @@ void sendEventToBackend(bool cry, float prob, double lat, double lng, bool gpsVa
         ts,
         deviceId);
 }
+
 static DeviceStatus makeDeviceStatus()
 {
     DeviceStatus st{};
@@ -159,6 +163,17 @@ static DeviceStatus makeDeviceStatus()
     WiFi.localIP().toString().toCharArray(st.device_ip, sizeof(st.device_ip));
     return st;
 }
+// ==== WiFi connected callback ====
+void onWifiConnected()
+{
+    log0("[WiFi] ĐÃ KẾT NỐI WIFI!");
+    pinMode(LED_WIFI_PIN, OUTPUT);
+    digitalWrite(LED_WIFI_PIN, HIGH);
+    playWifiSuccess();
+
+    setStatusMessage("WiFi Connected");
+}
+
 // ==== Speaker helpers ====
 static void playBeep(int freq, int durationMs, int volume);
 static void playVoice(const char *filename);
@@ -526,8 +541,8 @@ void setupAudioCry()
         return;
 
     const bool sharedPort = (MIC_I2S_PORT == SPK_I2S_PORT);
-    // logf("[AUDIO] Config MIC port=%d WS=%d BCLK=%d SD=%d", MIC_I2S_PORT, MIC_WS, MIC_SCK, MIC_SD);
-    // logf("[AUDIO] Config SPK port=%d BCLK=%d LRCK=%d DIN=%d", SPK_I2S_PORT, SPK_BCLK, SPK_LRCLK, SPK_DIN);
+    logf("[AUDIO] Config MIC port=%d WS=%d BCLK=%d SD=%d", MIC_I2S_PORT, MIC_WS, MIC_SCK, MIC_SD);
+    logf("[AUDIO] Config SPK port=%d BCLK=%d LRCK=%d DIN=%d", SPK_I2S_PORT, SPK_BCLK, SPK_LRCLK, SPK_DIN);
 
     if (sharedPort)
     {
@@ -843,12 +858,18 @@ static inline void releasePcmBlock(int16_t *block)
 void taskMic(void *param)
 {
     esp_task_wdt_add(nullptr);
+
     size_t bytes_read = 0;
     uint32_t blocksOk = 0;
 
-    for (;;)
+    const size_t bytes_per_block = I2S_READ_LEN * sizeof(int16_t);
+    const TickType_t timeout = pdMS_TO_TICKS(80); // đủ để fill 1024 mẫu
+
+    while (true)
     {
         esp_task_wdt_reset();
+
+        // Lấy block từ pool
         int16_t *block = acquirePcmBlock(pdMS_TO_TICKS(50));
         if (!block)
         {
@@ -856,40 +877,56 @@ void taskMic(void *param)
             continue;
         }
 
+        // Đọc I2S
         esp_err_t err = i2s_read(
             MIC_I2S_PORT,
             block,
-            I2S_READ_LEN * sizeof(int16_t),
+            bytes_per_block,
             &bytes_read,
-            pdMS_TO_TICKS(50));
+            timeout);
 
+        // ---------- Kiểm tra lỗi ----------
         if (err != ESP_OK)
         {
-            logf("[MIC] ERROR: i2s_read err=%d", err);
-        }
-
-        if (bytes_read == 0)
-        {
-            log0("[MIC] WARNING: bytes_read = 0");
-        }
-        else if (bytes_read != I2S_READ_LEN * sizeof(int16_t))
-        {
-            logf("[MIC] PARTIAL: bytes_read=%u expected=%u",
-                 bytes_read,
-                 I2S_READ_LEN * sizeof(int16_t));
-        }
-
-        if (err != ESP_OK || bytes_read != I2S_READ_LEN * sizeof(int16_t))
-        {
+            logf("[MIC] I2S ERROR: %d", err);
             releasePcmBlock(block);
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        // Nếu có dữ liệu thật sự
-        log0("[MIC] OK");
-        blocksOk++;
+        // ---------- Không có đủ dữ liệu ----------
+        if (bytes_read == 0)
+        {
+            static int zero_cnt = 0;
+            if (++zero_cnt % 200 == 0)
+                log0("[MIC] Timeout (bytes_read=0) – KHÔNG phải lỗi mic");
 
+            releasePcmBlock(block);
+            continue;
+        }
+
+        // ---------- PARTIAL → đọc đủ bằng vòng lặp bổ sung ----------
+        if (bytes_read < bytes_per_block)
+        {
+            size_t remain = bytes_per_block - bytes_read;
+            uint8_t *dst = (uint8_t *)block + bytes_read;
+
+            size_t br2 = 0;
+            i2s_read(MIC_I2S_PORT, dst, remain, &br2, timeout);
+            bytes_read += br2;
+
+            if (bytes_read < bytes_per_block)
+            {
+                logf("[MIC] PARTIAL: only %u/%u bytes", bytes_read, bytes_per_block);
+                releasePcmBlock(block);
+                continue;
+            }
+        }
+
+        blocksOk++;
+        if (blocksOk % 200 == 0)
+            logf("[MIC] OK blocks=%u", blocksOk);
+        // ---------- Gửi block vào queue PCM ----------
         if (xQueueSend(qPcm, &block, 0) != pdTRUE)
         {
             releasePcmBlock(block);
@@ -1228,31 +1265,53 @@ void setup()
 
     wifi_service_init();
     wifi_service_start();
+
     setupGPS();
     checkPsram();
     setupAudioCry();
-    // initBackendService();
-    //  Mount SPIFFS early and verify audio files are present.
+
+    // SPIFFS mount...
     if (!audioInitFS())
     {
         log0("[Init] SPIFFS mount failed, speaker playback will not work");
     }
-    else if (!SPIFFS.exists(AUDIO_ADPCM_NIGHT_ON) && !SPIFFS.exists(AUDIO_PCM_NIGHT_ON))
+    else if (!SPIFFS.exists(AUDIO_ADPCM_NIGHT_ON) &&
+             !SPIFFS.exists(AUDIO_PCM_NIGHT_ON))
     {
         log0("[Init] Audio files missing in SPIFFS (/audio/*.wav). Upload data folder before testing speaker.");
     }
     else
     {
         logSpiffsAudioFiles();
-        // audioSelfTest();
-        // Phát thêm tone 1 kHz 2s để kiểm tra phần cứng loa/I2S
-        // playTestTone();
     }
+
     setupWebServer();
     updateCryLed(false);
     pinMode(LED_NIGHT_PIN, OUTPUT);
     updateNightLed();
     wifi_update_led();
+
+    delay(6000); // chờ WiFi kết nối
+
+    int testDeviceId = 1; // ID thiết bị trong bảng thiet_bis
+    String ts = currentTimestamp();
+
+    Serial0.println("[TEST] Sending test cry event...");
+
+    api_send_event(
+        true,  // isCrying
+        0.92f, // prob
+        "DAY", // mode
+        false, // gpsValid
+        0.0,   // lat
+        0.0,   // lng
+        100,   // battery
+        ts,    // timestamp
+        testDeviceId);
+
+    Serial0.println("[TEST] Done sending");
+    // ====================================================================
+
 #if USE_MAX98357A_SPK
     if (!qSpeaker)
     {
@@ -1261,6 +1320,7 @@ void setup()
     }
 #endif
 
+    // Tạo các task khác
     xTaskCreatePinnedToCore(taskGps, "gps", 4096, nullptr, 3, &hGps, 1);
     xTaskCreatePinnedToCore(taskApp, "app", 4096, nullptr, 1, &hApp, 1);
     xTaskCreatePinnedToCore(taskWeb, "web", 4096, nullptr, 1, nullptr, 1);

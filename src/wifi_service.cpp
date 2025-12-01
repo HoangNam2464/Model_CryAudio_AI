@@ -13,6 +13,7 @@
 #include <freertos/event_groups.h>
 #include <freertos/task.h>
 
+extern void onWifiConnected();
 extern HardwareSerial Serial0;
 extern void setStatusMessage(const char *msg);
 
@@ -147,6 +148,8 @@ static const char *wifi_reason_to_text(uint8_t reason)
 
 static void wifi_mark_connected()
 {
+    bool firstTime = !g_wifiConnected;
+
     g_wifiConnected = true;
     g_authFailCount = 0;
     stop_setup_ap();
@@ -162,6 +165,11 @@ static void wifi_mark_connected()
     {
         LOGI("[WiFi] Link active\n");
         app_state_set_wifi(true, 0, "", "");
+    }
+
+    if (firstTime)
+    {
+        onWifiConnected();
     }
 
     if (g_wifiEventGroup)

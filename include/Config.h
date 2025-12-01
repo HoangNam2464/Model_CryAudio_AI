@@ -3,10 +3,9 @@
 
 #define WIFI_SSID      ""
 #define WIFI_PASS      ""
-#define DEVICE_ID      "esp32-audiocry"
+#define DEVICE_ID      1
 #define API_TOKEN      ""
-#define BACKEND_URL    "http://127.0.0.1:8000/api/cry-events"
-
+#define BACKEND_URL    "http://192.168.1.110:8000/api/cry-events"
 
 #define I2S_WS_PIN         4
 #define I2S_SCK_PIN        5

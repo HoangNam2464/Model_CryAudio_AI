@@ -5,6 +5,9 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 
+// Callback báo Wi-Fi đã kết nối
+extern void onWifiConnected();
+
 // Initialize Wi-Fi service (event group, prefs).
 void wifi_service_init();
 
