@@ -25,7 +25,22 @@ HardwareSerial Serial0(0);
 #include <tflm_infer.h>
 #include "audio_service/audio_service.h"
 #include "backend_service.h"
+#include "api_service.h"
 #include "wifi_portal.h"
+#include <time.h>
+
+String currentTimestamp()
+{
+    time_t now;
+    time(&now);
+
+    struct tm *tm_info = localtime(&now);
+
+    char buffer[32];
+    strftime(buffer, 32, "%Y-%m-%d %H:%M:%S", tm_info);
+
+    return String(buffer);
+}
 
 static constexpr bool LOG_GPS_RAW = false;
 static constexpr float CRY_THRESHOLD = 0.80f;
@@ -38,8 +53,6 @@ static const uint32_t WIFI_BACKOFF_MAX_MS = 30000;
 static const uint32_t WIFI_AP_FALLBACK_MS = 20000;
 static const char *SETUP_AP_SSID = "AudioCry-Setup";
 static const char *SETUP_AP_PASS = "12345678";
-
-// ====== GPS cấu hình (đã khai báo trong Config.h/board_config.h) ======
 
 // ====== I2S mic/loa (dùng nếu ENABLE_AUDIOCRY) ======
 static const int MIC_SD = I2S_SD_PIN;
@@ -106,6 +119,7 @@ static float g_lastScore = 0.0f;
 static bool g_isCrying = false;
 static char g_lastEvent[16] = "boot";
 static uint32_t g_lastEventTs = 0;
+static bool lastWasCry = false;
 static double g_lastLat = 0;
 static double g_lastLng = 0;
 static bool g_gpsValid = false;
@@ -113,10 +127,27 @@ char g_statusMessage[64] = "Booting";
 
 static int readBatteryPercent()
 {
-    // Placeholder until ADC-based battery measurement is hooked up.
-    return 87;
+    return 100;
 }
+void sendEventToBackend(bool cry, float prob, double lat, double lng, bool gpsValid)
+{
+    String mode = nightMode ? "NIGHT" : "DAY";
+    int battery = readBatteryPercent();
+    int deviceId = 1;
 
+    String ts = currentTimestamp();
+
+    api_send_event(
+        cry,
+        prob,
+        mode,
+        gpsValid,
+        lat,
+        lng,
+        battery,
+        ts,
+        deviceId);
+}
 static DeviceStatus makeDeviceStatus()
 {
     DeviceStatus st{};
@@ -495,8 +526,8 @@ void setupAudioCry()
         return;
 
     const bool sharedPort = (MIC_I2S_PORT == SPK_I2S_PORT);
-    logf("[AUDIO] Config MIC port=%d WS=%d BCLK=%d SD=%d", MIC_I2S_PORT, MIC_WS, MIC_SCK, MIC_SD);
-    logf("[AUDIO] Config SPK port=%d BCLK=%d LRCK=%d DIN=%d", SPK_I2S_PORT, SPK_BCLK, SPK_LRCLK, SPK_DIN);
+    // logf("[AUDIO] Config MIC port=%d WS=%d BCLK=%d SD=%d", MIC_I2S_PORT, MIC_WS, MIC_SCK, MIC_SD);
+    // logf("[AUDIO] Config SPK port=%d BCLK=%d LRCK=%d DIN=%d", SPK_I2S_PORT, SPK_BCLK, SPK_LRCLK, SPK_DIN);
 
     if (sharedPort)
     {
@@ -675,23 +706,27 @@ void taskGps(void *param)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
-
 // ==== Task App: log GPS, handle button night mode ====
 void taskApp(void *param)
 {
     pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
     pinMode(LED_NIGHT_PIN, OUTPUT);
     updateNightLed();
+
     bool lastBtn = HIGH;
     uint32_t lastChange = 0;
+
     uint32_t lastLog = 0;
     bool lastFixState = false;
     bool loggedNoFix = false;
+
     for (;;)
     {
-        // log GPS giảm spam: chỉ log khi thay đổi trạng thái hoặc định kỳ khi đã fix
+        // Giảm spam log GPS: chỉ log khi đổi trạng thái hoặc mỗi 10 giây
         uint32_t now = millis();
-        if (now - lastLog > 5000 || lastFixState != g_gps.fix)
+        const uint32_t LOG_INTERVAL = 10000;
+
+        if (now - lastLog > LOG_INTERVAL || lastFixState != g_gps.fix)
         {
             GpsData snapshot;
             if (xSemaphoreTake(gGpsMutex, pdMS_TO_TICKS(10)) == pdTRUE)
@@ -699,47 +734,63 @@ void taskApp(void *param)
                 snapshot = g_gps;
                 xSemaphoreGive(gGpsMutex);
             }
+
             g_lastLat = snapshot.lat;
             g_lastLng = snapshot.lon;
             g_gpsValid = snapshot.fix;
+
             if (snapshot.fix)
             {
-                logf("[GPS] Lat: %.6f, Lon: %.6f, Speed: %.2f, Sat: %u, Fix: OK",
+                logf("[GPS] FIX  | Lat=%.6f Lon=%.6f  V=%.2f  Sat=%u",
                      snapshot.lat, snapshot.lon, snapshot.speed, snapshot.sats);
+
                 loggedNoFix = false;
-                lastLog = now;
             }
-            else if (!loggedNoFix || lastFixState != snapshot.fix)
+            else
             {
-                logf("[GPS] Chưa fix (Sat=%u). Đợi tín hiệu...", snapshot.sats);
-                loggedNoFix = true;
-                lastLog = now;
+                if (!loggedNoFix || lastFixState != snapshot.fix)
+                {
+                    logf("[GPS] NOFIX | Sat=%u | Đang tìm tín hiệu...", snapshot.sats);
+                    loggedNoFix = true;
+                }
             }
+
             lastFixState = snapshot.fix;
+            lastLog = now;
         }
-        // toggle night mode
-        bool btn = digitalRead(MODE_BUTTON_PIN) == LOW;
+
+        // ==== Nút gạt chế độ day/night ====
+        bool btn = (digitalRead(MODE_BUTTON_PIN) == LOW);
         uint32_t nowMs = millis();
+
         if (btn && !lastBtn && (nowMs - lastChange) > 50)
         {
             lastChange = nowMs;
+
             nightMode = !nightMode;
             applyDetectorProfile();
+
             if (qSpeaker)
             {
-                SpeakerEvent ev = nightMode ? SpeakerEvent::EVENT_MODE_NIGHT : SpeakerEvent::EVENT_MODE_DAY;
+                SpeakerEvent ev = nightMode ? SpeakerEvent::EVENT_MODE_NIGHT
+                                            : SpeakerEvent::EVENT_MODE_DAY;
                 xQueueSend(qSpeaker, &ev, 0);
             }
+
             updateNightLed();
-            // Nhay LED Wi-Fi (LED xanh duong tren board) de bao doi che do
+
+            // Nháy LED báo chuyển mode
             digitalWrite(LED_WIFI_PIN, HIGH);
             vTaskDelay(pdMS_TO_TICKS(150));
             digitalWrite(LED_WIFI_PIN, LOW);
-            // Khoi phuc trang thai LED Wi-Fi theo ket noi hien tai
+
+            // Khôi phục LED WiFi theo trạng thái kết nối
             wifi_update_led();
+
             logf("[MODE] nightMode=%s", nightMode ? "ON" : "OFF");
             app_state_set_mode(nightMode, indoorMode);
         }
+
         lastBtn = btn;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -794,33 +845,56 @@ void taskMic(void *param)
     esp_task_wdt_add(nullptr);
     size_t bytes_read = 0;
     uint32_t blocksOk = 0;
+
     for (;;)
     {
         esp_task_wdt_reset();
         int16_t *block = acquirePcmBlock(pdMS_TO_TICKS(50));
         if (!block)
         {
-            esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
-        // Không để i2s_read block quá lâu để tránh WDT
-        esp_err_t err = i2s_read(MIC_I2S_PORT,
-                                 block,
-                                 I2S_READ_LEN * sizeof(int16_t),
-                                 &bytes_read,
-                                 pdMS_TO_TICKS(50));
+
+        esp_err_t err = i2s_read(
+            MIC_I2S_PORT,
+            block,
+            I2S_READ_LEN * sizeof(int16_t),
+            &bytes_read,
+            pdMS_TO_TICKS(50));
+
+        if (err != ESP_OK)
+        {
+            logf("[MIC] ERROR: i2s_read err=%d", err);
+        }
+
+        if (bytes_read == 0)
+        {
+            log0("[MIC] WARNING: bytes_read = 0");
+        }
+        else if (bytes_read != I2S_READ_LEN * sizeof(int16_t))
+        {
+            logf("[MIC] PARTIAL: bytes_read=%u expected=%u",
+                 bytes_read,
+                 I2S_READ_LEN * sizeof(int16_t));
+        }
+
         if (err != ESP_OK || bytes_read != I2S_READ_LEN * sizeof(int16_t))
         {
             releasePcmBlock(block);
-            vTaskDelay(pdMS_TO_TICKS(2));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+
+        // Nếu có dữ liệu thật sự
+        log0("[MIC] OK");
+        blocksOk++;
+
         if (xQueueSend(qPcm, &block, 0) != pdTRUE)
         {
             releasePcmBlock(block);
         }
-        blocksOk++;
+
         esp_task_wdt_reset();
     }
 }
@@ -898,6 +972,7 @@ void taskInfer(void *param)
         log0("[AI] No infer buffer");
         vTaskDelete(nullptr);
     }
+
     int retry = 0;
     const int kMaxRetry = 6;
     while (!tflm_begin())
@@ -911,11 +986,15 @@ void taskInfer(void *param)
         }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
+
     applyDetectorProfile();
+
     size_t filled = 0;
-    bool prevState = false;
+    bool prevState = false; // false = CALM, true = CRY
+
     for (;;)
     {
+        // Gom đủ TARGET_SAMPLES mẫu PCM cho 1 cửa sổ infer
         while (filled < TARGET_SAMPLES)
         {
             int16_t *block = acquirePcmBlock(pdMS_TO_TICKS(10));
@@ -931,16 +1010,23 @@ void taskInfer(void *param)
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
         }
+
+        // Chạy AI
         float prob = tflm_infer_prob(g_inferWindow, TARGET_SAMPLES);
         bool state = detector.update(prob);
         float score = detector.score();
+
         g_lastProb = prob;
         g_lastScore = score;
         g_isCrying = state;
-        static uint32_t lastLogMs = 0;
+
+        // 👉 Chỉ xử lý khi TRẠNG THÁI THAY ĐỔI (CALM ↔ CRY)
         if (state != prevState)
         {
+            // LED báo trạng thái
             updateCryLed(state);
+
+            // ===== Loa: chỉ phát 1 lần khi đổi trạng thái =====
             if (qSpeaker)
             {
                 SpeakerEvent ev;
@@ -948,14 +1034,19 @@ void taskInfer(void *param)
                     ev = state ? SpeakerEvent::EVENT_CRY_NIGHT : SpeakerEvent::EVENT_CALM_NIGHT;
                 else
                     ev = state ? SpeakerEvent::EVENT_CRY_DAY : SpeakerEvent::EVENT_CALM_DAY;
+
+                // Không spam: mỗi lần đổi trạng thái chỉ gửi 1 event
                 xQueueSend(qSpeaker, &ev, 0);
             }
+
+            // ===== GPS snapshot tại thời điểm đổi trạng thái =====
             GpsData snapshot{};
             if (xSemaphoreTake(gGpsMutex, pdMS_TO_TICKS(10)) == pdTRUE)
             {
                 snapshot = g_gps;
                 xSemaphoreGive(gGpsMutex);
             }
+
             if (indoorMode)
             {
                 snapshot.fix = false;
@@ -963,14 +1054,20 @@ void taskInfer(void *param)
                 snapshot.lon = g_fixedLng;
                 snapshot.sats = 0;
             }
+
             g_lastLat = snapshot.lat;
             g_lastLng = snapshot.lon;
             g_gpsValid = snapshot.fix;
             strncpy(g_lastEvent, state ? "cry_on" : "cry_off", sizeof(g_lastEvent) - 1);
             g_lastEvent[sizeof(g_lastEvent) - 1] = '\0';
+
             uint32_t nowMs = millis();
             g_lastEventTs = nowMs;
-            if (state && prob >= CRY_THRESHOLD && qEvents)
+
+            // ===== Backend event: CHỈ gửi khi CALM -> CRY =====
+            if (state         // đang CRY
+                && !prevState // trước đó là CALM
+                && prob >= CRY_THRESHOLD && qEvents)
             {
                 CryEvent evt{};
                 evt.cry.detected = true;
@@ -980,22 +1077,30 @@ void taskInfer(void *param)
                 evt.cry.threshold = CRY_THRESHOLD;
                 evt.cry.duration_ms = static_cast<uint32_t>(INFER_INTERVAL_S * 1000);
                 evt.cry.timestamp_ms = nowMs;
+
                 evt.gps.valid = snapshot.fix;
                 evt.gps.lat = snapshot.lat;
                 evt.gps.lng = snapshot.lon;
                 evt.gps.sats = snapshot.sats;
+
                 if (xQueueSend(qEvents, &evt, pdMS_TO_TICKS(10)) != pdTRUE)
                 {
                     log0("[AI] Event queue full");
                 }
+
                 logf("[AI] Baby cry detected, prob=%.3f, mode=%s",
                      prob, nightMode ? "night" : "day");
             }
+
             prevState = state;
+            if (!state) // CALM thì reset cờ gửi
+                lastWasCry = false;
+
             logf("[AI] prob_cry=%.3f state=%s score=%.3f night=%s",
                  prob, state ? "CRY" : "CALM", score, nightMode ? "ON" : "OFF");
-            lastLogMs = millis();
         }
+
+        // Chuẩn bị cho cửa sổ kế tiếp
         filled = 0;
         vTaskDelay(pdMS_TO_TICKS((uint32_t)(INFER_INTERVAL_S * 1000)));
     }
@@ -1009,19 +1114,37 @@ void taskSender(void *param)
         vTaskDelete(nullptr);
         return;
     }
+
     CryEvent evt;
+    static uint32_t lastSentMs = 0;
+
     for (;;)
     {
+        // Block tới khi nhận được sự kiện từ AI
         if (xQueueReceive(qEvents, &evt, portMAX_DELAY) != pdTRUE)
             continue;
-        // cần Wi-Fi sẵn sàng
-        wifi_ensure_connected(15000);
-        DeviceStatus st = makeDeviceStatus();
-        bool ok = sendCryEventToBackend(evt.cry, evt.gps, st);
-        if (!ok)
+        if (!evt.cry.detected)
+            continue;
+
+        if (lastWasCry)
         {
-            log0("[HTTP] Failed to push cry event");
+            continue;
         }
+
+        lastWasCry = true;
+        lastSentMs = millis();
+        wifi_ensure_connected(15000);
+
+        // ---- Gửi về backend ----
+        sendEventToBackend(
+            evt.cry.detected,
+            evt.cry.prob,
+            evt.gps.lat,
+            evt.gps.lng,
+            evt.gps.valid);
+
+        logf("[SEND] Event sent: prob=%.3f lat=%.6f lng=%.6f valid=%d",
+             evt.cry.prob, evt.gps.lat, evt.gps.lng, evt.gps.valid);
     }
 }
 
@@ -1108,8 +1231,8 @@ void setup()
     setupGPS();
     checkPsram();
     setupAudioCry();
-    initBackendService();
-    // Mount SPIFFS early and verify audio files are present.
+    // initBackendService();
+    //  Mount SPIFFS early and verify audio files are present.
     if (!audioInitFS())
     {
         log0("[Init] SPIFFS mount failed, speaker playback will not work");
@@ -1121,9 +1244,9 @@ void setup()
     else
     {
         logSpiffsAudioFiles();
-        audioSelfTest();
+        // audioSelfTest();
         // Phát thêm tone 1 kHz 2s để kiểm tra phần cứng loa/I2S
-        playTestTone();
+        // playTestTone();
     }
     setupWebServer();
     updateCryLed(false);
@@ -1161,8 +1284,3 @@ void loop()
 {
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
-
-#include <Arduino.h>
-// UPDATE: Đã kiểm tra runtime theo dự án test (WiFi/HTTP, MIC/LOA/GPS, Flash)
-#include <WiFi.h>
-
