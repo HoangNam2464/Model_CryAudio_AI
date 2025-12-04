@@ -1,13 +1,21 @@
 #include "api_service.h"
 #include "Config.h"
 #include "device_id.h"
-#include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <HardwareSerial.h>
+#include <SPIFFS.h>
+#include <FS.h>
+
+// Fallback JSON tĩnh nếu không tìm thấy file SPIFFS.
+static const char *kFallbackStaticJson =
+    "{\"device_id\":\"static\",\"is_crying\":false,\"prob\":0.0,"
+    "\"gps_valid\":0,\"lat\":0,\"lng\":0,\"battery\":100,\"mode\":\"STATIC\"}";
 
 extern HardwareSerial Serial0;
 
+// Gửi nội dung JSON tĩnh từ file thay vì dữ liệu AI động.
+// File được lấy từ STATIC_JSON_PATH trong SPIFFS.
 bool api_send_event(
     bool isCrying,
     float prob,
@@ -19,10 +27,49 @@ bool api_send_event(
     const String &timestamp,
     int deviceDbId)
 {
+    (void)isCrying;
+    (void)prob;
+    (void)mode;
+    (void)gpsValid;
+    (void)lat;
+    (void)lng;
+    (void)battery;
+    (void)timestamp;
+    (void)deviceDbId;
+
     if (WiFi.status() != WL_CONNECTED)
     {
         Serial0.println("[API] WiFi not connected");
         return false;
+    }
+
+    String body;
+    if (SPIFFS.begin(false))
+    {
+        File f = SPIFFS.open(STATIC_JSON_PATH, "r");
+        if (!f)
+        {
+            Serial0.printf("[API] Khong tim thay file JSON tinh: %s (se dung fallback)\n", STATIC_JSON_PATH);
+        }
+        else
+        {
+            body = f.readString();
+            f.close();
+            body.trim();
+            if (body.isEmpty())
+            {
+                Serial0.printf("[API] File JSON tinh %s rong, se dung fallback\n", STATIC_JSON_PATH);
+            }
+        }
+    }
+    else
+    {
+        Serial0.println("[API] SPIFFS mount failed, se dung fallback JSON");
+    }
+
+    if (body.isEmpty())
+    {
+        body = kFallbackStaticJson;
     }
 
     HTTPClient http;
@@ -30,27 +77,9 @@ bool api_send_event(
     http.begin(BACKEND_URL);
     http.addHeader("Content-Type", "application/json");
 
-    JsonDocument doc;
-
-    // Ưu tiên deviceDbId nếu caller truyền >0, nếu không sẽ lấy ID từ MAC (số).
-    int finalId = (deviceDbId > 0) ? deviceDbId : device_id_int();
-    doc["device_id"] = finalId;
-    doc["device_name"] = device_id_str();
-    doc["lat"] = lat;
-    doc["lng"] = lng;
-    doc["is_crying"] = isCrying;
-    doc["prob"] = prob;
-    doc["timestamp"] = timestamp;
-    doc["gps_valid"] = gpsValid ? 1 : 0;
-    doc["battery"] = battery;
-    doc["mode"] = mode;
-
-    String body;
-    serializeJson(doc, body);
-
-    Serial0.printf("[API] POST %s dev=%d(%s) cry=%d prob=%.2f gps=%d lat=%.6f lng=%.6f\n",
-                   BACKEND_URL, finalId, device_id_str().c_str(), isCrying, prob,
-                   gpsValid ? 1 : 0, lat, lng);
+    Serial0.printf("[API] POST %s payload_len=%u (source=%s)\n",
+                   BACKEND_URL, (unsigned)body.length(),
+                   body == kFallbackStaticJson ? "fallback" : STATIC_JSON_PATH);
 
     int code = http.POST(body);
     bool ok = (code == 200 || code == 201);

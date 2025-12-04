@@ -3,10 +3,13 @@
 
 #define WIFI_SSID      ""
 #define WIFI_PASS      ""
-// Để trống để tự sinh ID theo MAC (không trùng giữa các board). Chỉ đặt chuỗi cố định khi thật cần thiết.
+
 #define DEVICE_ID      ""
 #define API_TOKEN      ""
-#define BACKEND_URL    "http://192.168.1.110:8000/api/cry-events"
+#define BACKEND_URL    "http://172.20.10.8:8000/api/cry-events"
+#ifndef STATIC_JSON_PATH
+#define STATIC_JSON_PATH "/static_payload.json"
+#endif
 
 #define I2S_WS_PIN         4
 #define I2S_SCK_PIN        5

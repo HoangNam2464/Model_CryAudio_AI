@@ -1550,6 +1550,8 @@ void setup()
         Serial0.println("[NET] WiFi stable → syncing NTP...");
         initNtp();
         Serial0.println("[NET] NTP synced, waiting for real mic events to send.");
+        // Gửi 1 lần JSON tĩnh ngay khi Wi-Fi đã sẵn sàng để kiểm tra đường truyền API.
+        api_send_event(false, 0.0f, "STATIC", false, 0, 0, 100, currentTimestamp(), device_id_int());
     }
     else
     {

@@ -39,6 +39,7 @@ static TaskHandle_t g_wifiTask = nullptr;
 static bool g_wifiReconnectRequest = false;
 static bool g_noCredPause = false;
 static uint8_t g_authFailCount = 0;
+static uint8_t g_connectFailCount = 0; // consecutive connect failures (any reason)
 
 static void updateWifiLed()
 {
@@ -153,6 +154,7 @@ static void wifi_mark_connected()
 
     g_wifiConnected = true;
     g_authFailCount = 0;
+    g_connectFailCount = 0;
     stop_setup_ap();
     updateWifiLed();
 
@@ -315,6 +317,20 @@ static bool wifi_connect_once(const WifiCredentials &creds, bool hasStoredCred)
     {
         g_authFailCount = 0;
         setStatusMessage("WiFi bi mat ket noi, se thu lai...");
+    }
+
+    // After repeated failures (lost AP, moved router, etc.) start a setup AP so user can enter a new network.
+    g_connectFailCount = std::min<uint8_t>(g_connectFailCount + 1, 100);
+    bool shouldStartPortal = !g_setupApActive &&
+                             (g_connectFailCount >= 2 ||
+                              g_lastWifiReason == WIFI_REASON_NO_AP_FOUND ||
+                              g_lastWifiReason == WIFI_REASON_BEACON_TIMEOUT);
+
+    if (shouldStartPortal)
+    {
+        setStatusMessage("Khong ket noi WiFi cu, mo AP de cau hinh moi.");
+        ensure_setup_ap();
+        log_setup_portal_link("Mo AP cau hinh WiFi");
     }
 
     if (!hasStoredCred && !g_setupApActive)
